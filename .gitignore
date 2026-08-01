@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+
+# Working data: originals, diarization output, cuts, database.
+data/
+*.segments.json
+*.preview.html
+*.cuts.json
+skipcast.db
+
+.DS_Store

@@ -1,0 +1,517 @@
+"""The control panel served at /.
+
+One page, vanilla JS, no build step and no CDN. Laid out for a phone first
+because that is where it gets used — the desktop is meant to become a box you
+never touch.
+"""
+
+PAGE = r"""<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>skipcast</title>
+<style>
+  :root { --bg:#0f1115; --panel:#171a21; --panel2:#1e222b; --line:#2a2f3a;
+          --fg:#e7eaf0; --muted:#98a1b3; --accent:#4f9cf9; --ok:#22c55e;
+          --warn:#f97316; --bad:#ef4444; }
+  @media (prefers-color-scheme: light) {
+    :root { --bg:#f6f7f9; --panel:#fff; --panel2:#eef1f5; --line:#dfe3ea;
+            --fg:#14171d; --muted:#5c6675; --accent:#1f6feb; }
+  }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font:16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+         padding-bottom:env(safe-area-inset-bottom); }
+  header { position:sticky; top:0; z-index:20; background:var(--panel);
+           border-bottom:1px solid var(--line); padding:12px 16px 0;
+           padding-top:calc(12px + env(safe-area-inset-top)); }
+  h1 { font-size:17px; margin:0 0 10px; font-weight:650; letter-spacing:-0.01em; }
+  h1 span { color:var(--muted); font-weight:400; font-size:13px; }
+  nav { display:flex; gap:4px; overflow-x:auto; }
+  nav button { flex:none; background:none; border:none; color:var(--muted);
+    padding:9px 13px; font:inherit; font-size:14px; border-bottom:2px solid transparent;
+    cursor:pointer; }
+  nav button.on { color:var(--fg); border-bottom-color:var(--accent); font-weight:600; }
+  nav .badge { background:var(--accent); color:#fff; border-radius:9px;
+    padding:0 6px; font-size:11px; margin-left:5px; }
+  main { padding:16px; max-width:820px; margin:0 auto; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:12px;
+          padding:14px; margin-bottom:12px; }
+  .card h2 { font-size:11px; text-transform:uppercase; letter-spacing:.07em;
+             color:var(--muted); margin:0 0 10px; font-weight:650; }
+  .row { display:flex; align-items:center; gap:10px; }
+  .grow { flex:1; min-width:0; }
+  .title { font-weight:600; overflow:hidden; text-overflow:ellipsis;
+           white-space:nowrap; }
+  .sub { color:var(--muted); font-size:13px; }
+  .wrapline { white-space:normal; }
+  button.btn, a.btn { display:inline-block; background:var(--panel2); color:var(--fg);
+    border:1px solid var(--line); border-radius:9px; padding:9px 13px; font:inherit;
+    font-size:14px; cursor:pointer; text-decoration:none; }
+  button.btn:active { transform:scale(.97); }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  button.danger { color:var(--bad); }
+  button.btn:disabled { opacity:.45; }
+  input[type=text], input[type=search] { width:100%; background:var(--panel2);
+    color:var(--fg); border:1px solid var(--line); border-radius:9px; padding:11px;
+    font:inherit; font-size:16px; }
+  .pill { font-size:11px; padding:2px 8px; border-radius:99px; background:var(--panel2);
+    color:var(--muted); border:1px solid var(--line); white-space:nowrap; }
+  .pill.ready { color:var(--ok); } .pill.failed, .pill.refused { color:var(--bad); }
+  .pill.running { color:var(--accent); } .pill.pending, .pill.queued { color:var(--warn); }
+  .item { padding:11px 0; border-bottom:1px solid var(--line); }
+  .item:last-child { border-bottom:none; }
+  .swatch { width:10px; height:34px; border-radius:3px; flex:none; }
+  .muted { color:var(--muted); }
+  .stack { display:flex; flex-direction:column; gap:9px; }
+  .wrap { display:flex; flex-wrap:wrap; gap:8px; }
+  pre { background:var(--panel2); border-radius:9px; padding:11px; overflow-x:auto;
+        font-size:11.5px; line-height:1.45; max-height:260px; overflow-y:auto;
+        margin:0; white-space:pre-wrap; word-break:break-word; }
+  code { background:var(--panel2); padding:2px 6px; border-radius:5px; font-size:13px;
+         word-break:break-all; }
+  .switch { position:relative; width:48px; height:29px; flex:none; }
+  .switch input { opacity:0; width:0; height:0; }
+  .slider { position:absolute; inset:0; background:var(--panel2); border:1px solid var(--line);
+    border-radius:99px; transition:.15s; }
+  .slider:before { content:""; position:absolute; height:21px; width:21px; left:3px;
+    bottom:3px; background:var(--fg); border-radius:50%; transition:.15s; }
+  .switch input:checked + .slider { background:var(--bad); border-color:var(--bad); }
+  .switch input:checked + .slider:before { transform:translateX(19px); background:#fff; }
+  .empty { color:var(--muted); text-align:center; padding:26px 10px; font-size:14px; }
+  .toast { position:fixed; left:50%; transform:translateX(-50%); bottom:24px;
+    background:var(--fg); color:var(--bg); padding:11px 17px; border-radius:10px;
+    font-size:14px; z-index:100; max-width:88%; }
+  .back { color:var(--accent); cursor:pointer; font-size:14px; margin-bottom:12px;
+    display:inline-block; }
+  img.art { width:56px; height:56px; border-radius:9px; flex:none; background:var(--panel2); }
+  .spin { display:inline-block; width:13px; height:13px; border:2px solid var(--line);
+    border-top-color:var(--accent); border-radius:50%; animation:sp .8s linear infinite;
+    vertical-align:-2px; }
+  @keyframes sp { to { transform:rotate(360deg); } }
+</style></head>
+<body>
+<header>
+  <h1>skipcast <span id="hdr"></span></h1>
+  <nav>
+    <button data-tab="feeds" class="on">Podcasts</button>
+    <button data-tab="add">Add</button>
+    <button data-tab="speakers">Speakers</button>
+    <button data-tab="jobs">Activity<span class="badge" id="jobbadge" style="display:none"></span></button>
+  </nav>
+</header>
+<main id="main"></main>
+<audio id="player"></audio>
+
+<script>
+let STATE = null, TAB = 'feeds', VIEW = null, TIMER = null;
+const el = document.getElementById('main');
+const audio = document.getElementById('player');
+let stopAt = null, playingBtn = null;
+
+/* ---- helpers ---------------------------------------------------------- */
+const esc = s => (s ?? '').toString().replace(/[&<>"']/g,
+  c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const mins = s => s ? (s >= 3600 ? `${Math.floor(s/3600)}h ${Math.round(s%3600/60)}m`
+                                 : `${Math.round(s/60)}m`) : '0m';
+const clock = t => { const h=Math.floor(t/3600), m=Math.floor(t%3600/60), s=Math.floor(t%60);
+  return (h? h+':'+String(m).padStart(2,'0') : String(m))+':'+String(s).padStart(2,'0'); };
+
+function toast(msg, ms = 2600) {
+  document.querySelectorAll('.toast').forEach(t => t.remove());
+  const d = document.createElement('div');
+  d.className = 'toast'; d.textContent = msg;
+  document.body.appendChild(d);
+  setTimeout(() => d.remove(), ms);
+}
+
+async function api(path, opts = {}) {
+  const r = await fetch(path, {
+    headers: {'Content-Type': 'application/json'},
+    ...opts,
+    body: opts.body ? JSON.stringify(opts.body) : undefined,
+  });
+  let data = null;
+  try { data = await r.json(); } catch (e) {}
+  if (!r.ok) throw new Error((data && data.detail) || `${r.status}`);
+  return data;
+}
+
+function play(btn, key, start, end) {
+  if (playingBtn) playingBtn.classList.remove('primary');
+  if (playingBtn === btn && !audio.paused) { audio.pause(); playingBtn = null; return; }
+  const src = `/source/${key}.mp3`;
+  if (!audio.src.endsWith(src)) audio.src = src;
+  const go = () => { audio.currentTime = start; stopAt = end; audio.play().catch(()=>{}); };
+  if (audio.readyState > 0) go();
+  else audio.addEventListener('loadedmetadata', go, {once:true});
+  playingBtn = btn; btn.classList.add('primary');
+}
+audio.addEventListener('timeupdate', () => {
+  if (stopAt !== null && audio.currentTime >= stopAt) {
+    audio.pause(); stopAt = null;
+    if (playingBtn) { playingBtn.classList.remove('primary'); playingBtn = null; }
+  }
+});
+
+/* ---- data ------------------------------------------------------------- */
+async function refresh(silent) {
+  try {
+    STATE = await api('/api/state');
+    const running = STATE.jobs.filter(j => j.status === 'running' || j.status === 'queued');
+    const b = document.getElementById('jobbadge');
+    b.style.display = running.length ? '' : 'none';
+    b.textContent = running.length;
+    document.getElementById('hdr').textContent =
+      `${STATE.feeds.length} podcast${STATE.feeds.length === 1 ? '' : 's'}`;
+    if (!silent) render();
+    else if (TAB === 'jobs' || (VIEW && VIEW.kind === 'job')) render();
+    // Poll faster while something is working.
+    clearInterval(TIMER);
+    TIMER = setInterval(() => refresh(true), running.length ? 3000 : 20000);
+  } catch (e) { toast('Cannot reach server'); }
+}
+
+/* ---- views ------------------------------------------------------------ */
+function render() {
+  if (VIEW && VIEW.kind === 'feed') return renderFeed(VIEW);
+  if (VIEW && VIEW.kind === 'episode') return renderEpisode(VIEW);
+  if (VIEW && VIEW.kind === 'job') return renderJob(VIEW);
+  if (TAB === 'feeds') return renderFeeds();
+  if (TAB === 'add') return renderAdd();
+  if (TAB === 'speakers') return renderSpeakers();
+  if (TAB === 'jobs') return renderJobs();
+}
+
+function renderFeeds() {
+  if (!STATE.feeds.length) {
+    el.innerHTML = `<div class="empty">No podcasts yet.<br><br>
+      <button class="btn primary" onclick="go('add')">Add your first</button></div>`;
+    return;
+  }
+  el.innerHTML = STATE.feeds.map(f => `
+    <div class="card" onclick="openFeed('${esc(f.slug)}')" style="cursor:pointer">
+      <div class="row">
+        <div class="grow">
+          <div class="title">${esc(f.title || f.slug)}</div>
+          <div class="sub">${f.ready_count}/${f.total_count} episodes ready
+            · polled ${f.last_polled_at ? esc(f.last_polled_at.slice(0,10)) : 'never'}</div>
+        </div>
+        <span class="muted">›</span>
+      </div>
+    </div>`).join('');
+}
+
+function renderAdd() {
+  el.innerHTML = `
+    <div class="card">
+      <h2>${STATE.search_enabled ? 'Search for a podcast' : 'Add by RSS URL'}</h2>
+      <div class="stack">
+        ${STATE.search_enabled ? `
+        <input type="search" id="q" placeholder="Podcast name…"
+               autocapitalize="none" autocorrect="off">
+        <button class="btn primary" onclick="doSearch()">Search</button>` : ''}
+        <div id="results"></div>
+      </div>
+    </div>
+    <div class="card">
+      <h2>Add by RSS URL</h2>
+      <div class="stack">
+        <input type="text" id="url" placeholder="https://…/feed.xml"
+               autocapitalize="none" autocorrect="off">
+        <button class="btn" onclick="addUrl()">Subscribe</button>
+      </div>
+    </div>`;
+  const q = document.getElementById('q');
+  if (q) q.addEventListener('keydown', e => { if (e.key === 'Enter') doSearch(); });
+}
+
+async function doSearch() {
+  const q = document.getElementById('q').value.trim();
+  if (!q) return;
+  const box = document.getElementById('results');
+  box.innerHTML = '<div class="empty"><span class="spin"></span> Searching…</div>';
+  try {
+    const { results } = await api('/api/search?q=' + encodeURIComponent(q));
+    if (!results.length) { box.innerHTML = '<div class="empty">Nothing found.</div>'; return; }
+    box.innerHTML = results.map((r, i) => `
+      <div class="item row">
+        ${r.artwork ? `<img class="art" src="${esc(r.artwork)}" alt="">` : '<div class="art"></div>'}
+        <div class="grow">
+          <div class="title">${esc(r.title)}</div>
+          <div class="sub">${esc(r.author)} · ${r.episode_count} episodes</div>
+        </div>
+        <button class="btn primary" onclick='subscribe(${JSON.stringify(r.feed_url)}, this)'>Add</button>
+      </div>`).join('');
+  } catch (e) { box.innerHTML = `<div class="empty">${esc(e.message)}</div>`; }
+}
+
+async function subscribe(url, btn) {
+  if (btn) { btn.disabled = true; btn.textContent = '…'; }
+  try {
+    const r = await api('/api/feeds', {method:'POST', body:{url}});
+    toast(`Added ${r.title || r.slug}`);
+    await refresh(true);
+    openFeed(r.slug);
+  } catch (e) {
+    toast(e.message);
+    if (btn) { btn.disabled = false; btn.textContent = 'Add'; }
+  }
+}
+const addUrl = () => {
+  const u = document.getElementById('url').value.trim();
+  if (u) subscribe(u, null);
+};
+
+async function openFeed(slug) {
+  VIEW = {kind:'feed', slug, data:null};
+  el.innerHTML = '<div class="empty"><span class="spin"></span></div>';
+  try { VIEW.data = await api(`/api/feeds/${slug}/episodes`); }
+  catch (e) { toast(e.message); VIEW = null; return render(); }
+  render();
+}
+
+function renderFeed(v) {
+  const f = v.data.feed, eps = v.data.episodes;
+  const feedUrl = `${STATE.base_url}/feeds/${f.slug}.xml`;
+  el.innerHTML = `
+    <span class="back" onclick="VIEW=null;render()">‹ Podcasts</span>
+    <div class="card">
+      <div class="title wrapline">${esc(f.title || f.slug)}</div>
+      <div class="sub" style="margin:8px 0">Subscribe in your podcast app:</div>
+      <code>${esc(feedUrl)}</code>
+      <div class="wrap" style="margin-top:11px">
+        <button class="btn" onclick='copy(${JSON.stringify(feedUrl)})'>Copy link</button>
+        <a class="btn" href="${esc(feedUrl)}">Open</a>
+      </div>
+    </div>
+    <div class="card">
+      <h2>Fetch new episodes</h2>
+      <div class="wrap">
+        <button class="btn primary" onclick="pollFeed('${esc(f.slug)}',1)">Newest 1</button>
+        <button class="btn" onclick="pollFeed('${esc(f.slug)}',3)">Newest 3</button>
+        <button class="btn danger" onclick="unsub('${esc(f.slug)}')">Unsubscribe</button>
+      </div>
+      <div class="sub" style="margin-top:9px">Each episode takes roughly 15 minutes
+        to download, diarize and cut.</div>
+    </div>
+    <div class="card">
+      <h2>Episodes</h2>
+      ${eps.length ? eps.map(e => `
+        <div class="item row" onclick="openEpisode('${esc(e.key)}')" style="cursor:pointer">
+          <div class="grow">
+            <div class="title">${esc(e.title)}</div>
+            <div class="sub">${e.status === 'ready'
+              ? `${mins(e.result_seconds)} · ${mins(e.cut_seconds)} of ${esc(e.cut_speakers || 'nobody')} removed`
+              : esc((e.error || e.status).slice(0,90))}</div>
+          </div>
+          <span class="pill ${esc(e.status)}">${esc(e.status)}</span>
+        </div>`).join('')
+      : '<div class="empty">Nothing fetched yet. Tap “Newest 1”.</div>'}
+    </div>`;
+}
+
+async function pollFeed(slug, limit) {
+  try {
+    const r = await api(`/api/feeds/${slug}/poll`, {method:'POST', body:{limit}});
+    toast('Started — watch it in Activity');
+    await refresh(true);
+    openJob(r.job_id);
+  } catch (e) { toast(e.message); }
+}
+
+async function unsub(slug) {
+  if (!confirm('Unsubscribe? Downloaded files stay on disk.')) return;
+  try {
+    await api(`/api/feeds/${slug}`, {method:'DELETE'});
+    VIEW = null; toast('Unsubscribed'); refresh();
+  } catch (e) { toast(e.message); }
+}
+
+async function openEpisode(key) {
+  VIEW = {kind:'episode', key, data:null};
+  el.innerHTML = '<div class="empty"><span class="spin"></span></div>';
+  try { VIEW.data = await api(`/api/episodes/${key}`); }
+  catch (e) { toast(e.message); VIEW = null; return render(); }
+  render();
+}
+
+function renderEpisode(v) {
+  const e = v.data;
+  const known = STATE.speakers.map(s => `<option value="${esc(s.name)}">`).join('');
+  el.innerHTML = `
+    <span class="back" onclick="VIEW=null;render()">‹ Back</span>
+    <div class="card">
+      <div class="title wrapline">${esc(e.title)}</div>
+      <div class="sub" style="margin-top:6px">
+        ${e.status === 'ready'
+          ? `${mins(e.original_seconds)} → <b>${mins(e.result_seconds)}</b> ·
+             ${mins(e.cut_seconds)} of ${esc(e.cut_speakers || 'nobody')} removed`
+          : esc(e.error || e.status)}
+      </div>
+    </div>
+    <div class="card">
+      <h2>Who is in this episode</h2>
+      <div class="sub" style="margin-bottom:11px">Tap ▶ to hear a voice, then name it.
+        Named voices are recognised in every future episode.</div>
+      ${e.clusters.length ? e.clusters.map(c => `
+        <div class="item">
+          <div class="row">
+            <div class="swatch" style="background:${esc(c.color)}"></div>
+            <div class="grow">
+              <div class="title">${esc(c.matched_name || c.speaker_label)}
+                ${c.skip ? '<span class="pill" style="color:var(--bad)">cut</span>' : ''}</div>
+              <div class="sub">${mins(c.total_seconds)} ·
+                ${c.matched_name ? `matched ${c.similarity.toFixed(2)}`
+                  : (c.closest_name ? `closest ${esc(c.closest_name)} ${c.similarity.toFixed(2)}`
+                                    : 'not recognised')}</div>
+            </div>
+          </div>
+          <div class="wrap" style="margin-top:9px">
+            ${c.samples.map(s => `<button class="btn"
+                onclick="play(this,'${esc(e.key)}',${s.start},${s.end})">▶ ${clock(s.start)}
+                <span class="muted">${s.duration}s</span></button>`).join('')}
+          </div>
+          ${c.has_embedding ? `
+          <div class="row" style="margin-top:9px">
+            <input type="text" class="grow" list="known" placeholder="Name this voice…"
+                   value="${esc(c.matched_name || '')}"
+                   id="n-${esc(c.speaker_label)}" autocapitalize="words">
+            <button class="btn primary"
+              onclick="nameIt('${esc(e.key)}','${esc(c.speaker_label)}')">Save</button>
+          </div>` : '<div class="sub" style="margin-top:8px">Too little clean speech to identify.</div>'}
+        </div>`).join('')
+      : '<div class="empty">Not diarized yet.</div>'}
+      <datalist id="known">${known}</datalist>
+    </div>
+    <div class="card">
+      <h2>Redo</h2>
+      <div class="wrap">
+        <button class="btn primary" onclick="epJob('${esc(e.key)}','recut')">Re-cut</button>
+        <button class="btn" onclick="epJob('${esc(e.key)}','reprocess')">Reprocess</button>
+      </div>
+      <div class="sub" style="margin-top:9px">Re-cut re-applies the current skip flags
+        using the existing analysis — about a minute. Reprocess downloads and
+        re-analyses from scratch.</div>
+    </div>`;
+}
+
+async function nameIt(key, cluster) {
+  const name = document.getElementById('n-' + cluster).value.trim();
+  if (!name) return toast('Enter a name first');
+  try {
+    await api(`/api/episodes/${key}/label`, {method:'POST',
+      body:{cluster_label: cluster, name}});
+    toast(`Saved ${name}`);
+    await refresh(true);
+    openEpisode(key);
+  } catch (e) { toast(e.message); }
+}
+
+async function epJob(key, action) {
+  try {
+    const r = await api(`/api/episodes/${key}/${action}`, {method:'POST'});
+    toast('Started'); await refresh(true); openJob(r.job_id);
+  } catch (e) { toast(e.message); }
+}
+
+function renderSpeakers() {
+  el.innerHTML = `
+    <div class="card">
+      <h2>Known voices</h2>
+      <div class="sub" style="margin-bottom:11px">Switch someone on to cut them from
+        every future episode. Already-processed episodes need a re-cut.</div>
+      ${STATE.speakers.length ? STATE.speakers.map(s => `
+        <div class="item row">
+          <div class="grow">
+            <div class="title">${esc(s.name)}</div>
+            <div class="sub">${s.profiles} voice sample${s.profiles === 1 ? '' : 's'}
+              · ${mins(s.total_seconds)} heard</div>
+          </div>
+          <span class="sub">cut</span>
+          <label class="switch">
+            <input type="checkbox" ${s.skip ? 'checked' : ''}
+                   onchange='setSkip(${JSON.stringify(s.name)}, this.checked)'>
+            <span class="slider"></span>
+          </label>
+        </div>`).join('')
+      : `<div class="empty">No voices named yet.<br>Open an episode and name the
+         speakers you hear.</div>`}
+    </div>`;
+}
+
+async function setSkip(name, skip) {
+  try {
+    await api(`/api/speakers/${encodeURIComponent(name)}/skip`, {method:'POST', body:{skip}});
+    toast(skip ? `${name} will be cut` : `${name} will be kept`);
+    refresh(true);
+  } catch (e) { toast(e.message); }
+}
+
+function renderJobs() {
+  el.innerHTML = `<div class="card"><h2>Recent activity</h2>
+    ${STATE.jobs.length ? STATE.jobs.map(j => `
+      <div class="item row" onclick="openJob(${j.id})" style="cursor:pointer">
+        <div class="grow">
+          <div class="title">${esc(j.label || j.kind)}</div>
+          <div class="sub">${esc((j.progress || j.error || '').slice(0,80))}</div>
+        </div>
+        <span class="pill ${esc(j.status)}">${j.status === 'running'
+          ? '<span class="spin"></span> running' : esc(j.status)}</span>
+      </div>`).join('')
+    : '<div class="empty">Nothing has run yet.</div>'}</div>`;
+}
+
+async function openJob(id) {
+  VIEW = {kind:'job', id, data:null};
+  try { VIEW.data = await api('/api/jobs/' + id); } catch (e) { toast(e.message); }
+  render();
+}
+
+function renderJob(v) {
+  const j = v.data || {};
+  el.innerHTML = `
+    <span class="back" onclick="VIEW=null;TAB='jobs';syncTabs();render()">‹ Activity</span>
+    <div class="card">
+      <div class="row">
+        <div class="grow"><div class="title">${esc(j.label || j.kind || '')}</div>
+        <div class="sub">${esc(j.started_at || j.created_at || '')}</div></div>
+        <span class="pill ${esc(j.status)}">${j.status === 'running'
+          ? '<span class="spin"></span> running' : esc(j.status)}</span>
+      </div>
+      ${j.status === 'queued' ? `<button class="btn danger" style="margin-top:11px"
+        onclick="cancelJob(${j.id})">Cancel</button>` : ''}
+      ${j.error ? `<div class="sub" style="color:var(--bad);margin-top:11px">${esc(j.error)}</div>` : ''}
+    </div>
+    <div class="card"><h2>Log</h2><pre id="log">${esc(j.log || '(nothing yet)')}</pre></div>`;
+  const pre = document.getElementById('log');
+  if (pre) pre.scrollTop = pre.scrollHeight;
+  if (j.status === 'running' || j.status === 'queued') {
+    setTimeout(() => { if (VIEW && VIEW.kind === 'job' && VIEW.id === j.id) openJob(j.id); }, 3000);
+  }
+}
+
+async function cancelJob(id) {
+  const r = await api(`/api/jobs/${id}/cancel`, {method:'POST'});
+  toast(r.ok ? 'Cancelled' : r.note); refresh(true); openJob(id);
+}
+
+function copy(text) {
+  if (navigator.clipboard) navigator.clipboard.writeText(text).then(
+    () => toast('Copied'), () => toast('Copy failed'));
+  else toast('Copy not available');
+}
+
+/* ---- nav -------------------------------------------------------------- */
+function syncTabs() {
+  document.querySelectorAll('nav button').forEach(
+    b => b.classList.toggle('on', b.dataset.tab === TAB));
+}
+function go(tab) { TAB = tab; VIEW = null; syncTabs(); render(); }
+document.querySelectorAll('nav button').forEach(
+  b => b.onclick = () => go(b.dataset.tab));
+
+refresh();
+</script></body></html>
+"""

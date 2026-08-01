@@ -1,0 +1,34 @@
+[project]
+name = "skipcast"
+version = "0.1.0"
+description = "Remove specific speakers from podcast episodes and republish them as a private RSS feed."
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+
+# Phase 0 only needs diarization. feedparser / fastapi / uvicorn get added
+# in Phase 3 when there is something to serve.
+dependencies = [
+    "pyannote.audio>=3.1,<4",
+    # torchaudio 2.9 dropped torchaudio.AudioMetaData, which pyannote.audio 3.x
+    # still imports at module load. Anything at or above 2.9 fails on import,
+    # so both halves of the pair are held below it.
+    "torch>=2.2,<2.9",
+    "torchaudio>=2.2,<2.9",
+    # huggingface_hub 1.0 removed the use_auth_token kwarg, which
+    # pyannote.audio 3.x passes to hf_hub_download with no alternative.
+    "huggingface_hub>=0.23,<1.0",
+    "yt-dlp>=2024.1",
+    "feedparser>=6.0",
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+]
+
+[project.scripts]
+skipcast = "skipcast.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/skipcast"]

@@ -1,0 +1,120 @@
+# skipcast configuration.
+#
+# Every tunable lives in this file. Nothing that changes the shape of the
+# output should be hardcoded in the Python.
+#
+# Resolution order: --config <path>, then ./config.toml, then
+# ~/.config/skipcast/config.toml, then the built-in defaults in config.py.
+
+[paths]
+# Where downloads, cut files, and the database live. Relative to this file.
+data_dir = "data"
+
+[fetch]
+# `skipcast analyze <url>` and `skipcast fetch <url>` pull audio with yt-dlp.
+# Downloads land in data_dir/source_dir.
+source_dir = "sources"
+
+# yt-dlp format selector. bestaudio avoids pulling video streams we discard.
+format = "bestaudio/best"
+
+# Keep the file exactly as delivered next to the transcoded MP3, so a bad
+# transcode can be redone without hitting the network again.
+keep_original = true
+
+[diarize]
+# Gated model. Accept the terms at huggingface.co/pyannote/speaker-diarization-3.1
+# and huggingface.co/pyannote/segmentation-3.0, then export HF_TOKEN.
+pipeline = "pyannote/speaker-diarization-3.1"
+
+# "auto" picks mps on Apple Silicon and falls back to cpu. Set to "cpu" if
+# mps produces garbage or crashes; it is slower but always correct.
+device = "auto"
+
+# Leave at 0 to let the pipeline decide how many speakers there are.
+# Setting num_speakers overrides min/max. Useful when you know a show is
+# always the same two hosts plus one guest.
+num_speakers = 0
+min_speakers = 0
+max_speakers = 0
+
+# Diarization runs on a decoded 16 kHz mono WAV, never on the source MP3.
+sample_rate = 16000
+
+[identity]
+# Phase 1. Cosine similarity above which a diarized cluster is considered
+# the same person as a stored speaker profile.
+match_threshold = 0.70
+
+[cut]
+# Phase 2. Segment-selection rules.
+
+# Adjacent segments from the same speaker separated by less than this many
+# seconds are merged into one region before any other rule is applied.
+merge_gap_seconds = 1.5
+
+# A region belonging to a skipped speaker is only cut if it is at least this
+# long. Short interjections stay in. Cutting every "yeah" and "mhm" produces
+# unlistenable audio.
+min_skip_seconds = 15.0
+
+# Each cut boundary is moved inward by this much so the cut does not clip the
+# first or last syllable of the speaker being kept.
+boundary_padding_seconds = 0.25
+
+# Crossfade applied at each join between surviving pieces.
+crossfade_seconds = 0.15
+
+# When two cut regions end up back to back, the only thing between them is
+# their own inward padding. That padding exists to protect a kept speaker, and
+# between two cuts there is no kept speaker — leaving it behind strands a
+# fraction of a second of the removed voice between two jumps. Set false to
+# keep the padding literally in that case.
+merge_adjacent_cuts = true
+
+# If the rules want to remove more than this fraction of an episode,
+# something is wrong. Log a warning and skip the episode rather than emit
+# garbage.
+max_skip_fraction = 0.5
+
+[serve]
+# The feed and the audio are served over Tailscale, so no auth layer.
+host = "0.0.0.0"
+port = 8730
+
+# The base URL your phone will actually use. Enclosure URLs in the generated
+# feed are built from this, so "localhost" works for testing on this machine
+# but must become the tailnet name before AntennaPod can fetch anything —
+# e.g. "http://your-machine.tailnet-name.ts.net:8730".
+base_url = "http://localhost:8730"
+
+# The control panel at / lets you subscribe, poll, label speakers and set skip
+# flags from a phone browser over Tailscale. There is no auth, by design —
+# it is only reachable on your tailnet.
+enable_ui = true
+
+# Podcast search by name uses Apple's public directory to turn a show name into
+# an RSS URL. Read-only, no account, nothing sent but the search term. Set
+# false to keep skipcast entirely self-contained; pasting feed URLs still works.
+enable_search = true
+
+[poll]
+# Newest N episodes considered per feed on each poll. Podcast feeds routinely
+# carry hundreds of back episodes; processing them all on first subscribe
+# would run for days.
+max_episodes = 5
+
+# Stop after this many failures in one run rather than grinding through a
+# whole broken feed.
+max_failures = 3
+
+# Automatic polling. Every feed whose last poll is older than this gets one
+# queued. Scheduling lives inside `skipcast serve` rather than in a separate
+# launchd job so it goes through the same worker — two processes diarizing at
+# once would fight over the GPU and the database. Set 0 to poll only by hand.
+interval_hours = 6
+
+[encode]
+# Re-encode rather than stream-copy. See cut.py for why.
+bitrate = "128k"
+channels = 1
