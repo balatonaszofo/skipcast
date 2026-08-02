@@ -85,6 +85,16 @@ CREATE TABLE IF NOT EXISTS episodes (
 );
 
 CREATE INDEX IF NOT EXISTS episodes_feed ON episodes(feed_id, published_ts DESC);
+
+-- Where you got to in each episode. Server-side rather than in the browser so
+-- your place survives clearing site data and follows you between devices.
+CREATE TABLE IF NOT EXISTS playback (
+    episode_key TEXT PRIMARY KEY,
+    position    REAL NOT NULL DEFAULT 0,
+    duration    REAL,
+    finished    INTEGER NOT NULL DEFAULT 0,
+    updated_at  TEXT NOT NULL
+);
 """
 
 
@@ -289,6 +299,39 @@ def feed_episodes(conn: sqlite3.Connection, feed_id: int, ready_only: bool = Tru
         sql += " AND status = 'ready'"
     sql += " ORDER BY published_ts DESC, id DESC"
     return conn.execute(sql, (feed_id,)).fetchall()
+
+
+def set_position(conn: sqlite3.Connection, key: str, position: float,
+                 duration: float | None, finished: bool) -> None:
+    conn.execute(
+        """INSERT INTO playback (episode_key, position, duration, finished, updated_at)
+           VALUES (?,?,?,?,?)
+           ON CONFLICT(episode_key) DO UPDATE SET
+               position=excluded.position, duration=excluded.duration,
+               finished=excluded.finished, updated_at=excluded.updated_at""",
+        (key, max(0.0, position), duration, 1 if finished else 0, _now()),
+    )
+    conn.commit()
+
+
+def positions(conn: sqlite3.Connection) -> dict[str, dict]:
+    rows = conn.execute("SELECT * FROM playback").fetchall()
+    return {
+        r["episode_key"]: {"position": r["position"], "duration": r["duration"],
+                           "finished": bool(r["finished"])}
+        for r in rows
+    }
+
+
+def ready_episodes(conn: sqlite3.Connection, limit: int = 100):
+    """Everything playable, newest first, across every feed."""
+    return conn.execute(
+        """SELECT e.*, f.slug AS feed_slug, f.title AS feed_title
+             FROM episodes e JOIN feeds f ON f.id = e.feed_id
+            WHERE e.status = 'ready' AND e.cut_path IS NOT NULL
+            ORDER BY e.published_ts DESC, e.id DESC LIMIT ?""",
+        (limit,),
+    ).fetchall()
 
 
 def mark_polled(conn: sqlite3.Connection, feed_id: int) -> None:

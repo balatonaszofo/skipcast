@@ -162,6 +162,63 @@ def create_app(cfg: Config) -> FastAPI:
         c.close()
         return state
 
+    @app.get("/api/episodes")
+    def api_all_episodes(limit: int = 100):
+        """Everything playable, for the Listen tab."""
+        _need_ui()
+        c = conn()
+        pos = db.positions(c)
+        out = []
+        for r in db.ready_episodes(c, limit):
+            d = _row(r)
+            p = pos.get(r["key"], {})
+            d["position"] = p.get("position", 0.0)
+            d["finished"] = p.get("finished", False)
+            out.append(d)
+        c.close()
+        return {"episodes": out}
+
+    @app.post("/api/playback/{key}")
+    async def api_playback(key: str, request: Request):
+        _need_ui()
+        body = await request.json()
+        c = conn()
+        db.set_position(c, key, float(body.get("position") or 0),
+                        body.get("duration"), bool(body.get("finished")))
+        c.close()
+        return {"ok": True}
+
+    @app.api_route("/manifest.webmanifest", methods=["GET", "HEAD"])
+    def manifest():
+        # Lets the control panel install to the home screen and open without
+        # browser chrome, which is what makes it feel like a podcast app.
+        return JSONResponse({
+            "name": "skipcast",
+            "short_name": "skipcast",
+            "start_url": "/",
+            "scope": "/",
+            "display": "standalone",
+            "background_color": "#0f1115",
+            "theme_color": "#0f1115",
+            "icons": [
+                {"src": "/icon.svg", "sizes": "any", "type": "image/svg+xml",
+                 "purpose": "any maskable"},
+            ],
+        }, media_type="application/manifest+json")
+
+    @app.api_route("/icon.svg", methods=["GET", "HEAD"])
+    def icon():
+        svg = (
+            '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">'
+            '<rect width="512" height="512" rx="96" fill="#0f1115"/>'
+            '<circle cx="256" cy="256" r="150" fill="none" stroke="#4f9cf9"'
+            ' stroke-width="28"/>'
+            '<path d="M212 186l132 70-132 70z" fill="#4f9cf9"/>'
+            '</svg>'
+        )
+        return Response(content=svg, media_type="image/svg+xml",
+                        headers={"cache-control": "max-age=86400"})
+
     @app.get("/api/search")
     def api_search(q: str):
         _need_ui()

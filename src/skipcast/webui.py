@@ -10,6 +10,11 @@ PAGE = r"""<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#0f1115">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" href="/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/icon.svg">
 <title>skipcast</title>
 <style>
   :root { --bg:#0f1115; --panel:#171a21; --panel2:#1e222b; --line:#2a2f3a;
@@ -90,19 +95,60 @@ PAGE = r"""<!doctype html>
     border-top-color:var(--accent); border-radius:50%; animation:sp .8s linear infinite;
     vertical-align:-2px; }
   @keyframes sp { to { transform:rotate(360deg); } }
+
+  /* ---- player ---- */
+  .prog { height:4px; background:var(--panel2); border-radius:2px; overflow:hidden;
+          margin-top:7px; }
+  .prog > i { display:block; height:100%; background:var(--accent); }
+  #mini { position:fixed; left:0; right:0; bottom:0; z-index:50; background:var(--panel);
+    border-top:1px solid var(--line); padding:10px 14px;
+    padding-bottom:calc(10px + env(safe-area-inset-bottom)); display:none; }
+  #mini.on { display:block; }
+  #mini .mtitle { font-size:13.5px; font-weight:600; overflow:hidden;
+    text-overflow:ellipsis; white-space:nowrap; }
+  #mini .msub { font-size:11.5px; color:var(--muted); font-variant-numeric:tabular-nums; }
+  #mini .controls { display:flex; align-items:center; gap:8px; margin-top:8px; }
+  #mini button { background:var(--panel2); border:1px solid var(--line); color:var(--fg);
+    border-radius:10px; padding:9px 12px; font:inherit; font-size:13px; cursor:pointer; }
+  #mini button.play { background:var(--accent); border-color:var(--accent); color:#fff;
+    min-width:56px; font-size:16px; }
+  #scrub { flex:1; -webkit-appearance:none; appearance:none; height:20px;
+    background:transparent; }
+  #scrub::-webkit-slider-runnable-track { height:4px; background:var(--panel2);
+    border-radius:2px; }
+  #scrub::-webkit-slider-thumb { -webkit-appearance:none; width:15px; height:15px;
+    border-radius:50%; background:var(--accent); margin-top:-5.5px; }
+  #scrub::-moz-range-track { height:4px; background:var(--panel2); border-radius:2px; }
+  #scrub::-moz-range-thumb { width:15px; height:15px; border:none; border-radius:50%;
+    background:var(--accent); }
+  body.playing main { padding-bottom:130px; }
 </style></head>
 <body>
 <header>
   <h1>skipcast <span id="hdr"></span></h1>
   <nav>
-    <button data-tab="feeds" class="on">Podcasts</button>
+    <button data-tab="listen" class="on">Listen</button>
+    <button data-tab="feeds">Podcasts</button>
     <button data-tab="add">Add</button>
     <button data-tab="speakers">Speakers</button>
     <button data-tab="jobs">Activity<span class="badge" id="jobbadge" style="display:none"></span></button>
   </nav>
 </header>
 <main id="main"></main>
-<audio id="player"></audio>
+<audio id="player" preload="metadata"></audio>
+
+<div id="mini">
+  <div class="mtitle" id="m-title"></div>
+  <div class="msub" id="m-sub"></div>
+  <div class="controls">
+    <button onclick="seekBy(-15)" aria-label="back 15 seconds">−15</button>
+    <button class="play" id="m-play" onclick="togglePlay()">▶</button>
+    <button onclick="seekBy(30)" aria-label="forward 30 seconds">+30</button>
+    <button id="m-rate" onclick="cycleRate()">1×</button>
+    <button onclick="closePlayer()" aria-label="close">✕</button>
+  </div>
+  <input type="range" id="scrub" min="0" max="1000" value="0" style="width:100%">
+</div>
 
 <script>
 let STATE = null, TAB = 'feeds', VIEW = null, TIMER = null;
@@ -138,9 +184,12 @@ async function api(path, opts = {}) {
   return data;
 }
 
+/* Speaker samples and full episodes share one <audio>. A sample sets stopAt so
+   it cuts off after a few seconds; an episode clears it. */
 function play(btn, key, start, end) {
   if (playingBtn) playingBtn.classList.remove('primary');
   if (playingBtn === btn && !audio.paused) { audio.pause(); playingBtn = null; return; }
+  NOW = null; closeMini();
   const src = `/source/${key}.mp3`;
   if (!audio.src.endsWith(src)) audio.src = src;
   const go = () => { audio.currentTime = start; stopAt = end; audio.play().catch(()=>{}); };
@@ -148,12 +197,146 @@ function play(btn, key, start, end) {
   else audio.addEventListener('loadedmetadata', go, {once:true});
   playingBtn = btn; btn.classList.add('primary');
 }
+
+/* ---- episode player ---------------------------------------------------- */
+let NOW = null, RATE = 1, scrubbing = false, lastSave = 0;
+const RATES = [1, 1.25, 1.5, 1.75, 2];
+
+function playEpisode(key) {
+  const ep = (LISTEN || []).find(e => e.key === key);
+  if (!ep) return;
+  if (NOW && NOW.key === key) { togglePlay(); return; }
+  savePosition(true);
+  NOW = ep;
+  stopAt = null;
+  if (playingBtn) { playingBtn.classList.remove('primary'); playingBtn = null; }
+  audio.src = `/audio/${key}.mp3`;
+  audio.playbackRate = RATE;
+  const start = (ep.finished ? 0 : (ep.position || 0));
+  const go = () => {
+    if (start > 0 && start < (audio.duration || Infinity) - 5) audio.currentTime = start;
+    audio.play().catch(e => toast('Playback blocked — tap play again'));
+  };
+  if (audio.readyState > 0) go();
+  else audio.addEventListener('loadedmetadata', go, {once:true});
+  document.body.classList.add('playing');
+  document.getElementById('mini').classList.add('on');
+  document.getElementById('m-title').textContent = ep.title || '';
+  setMediaSession(ep);
+  updateMini();
+  render();
+}
+
+function togglePlay() {
+  if (!NOW) return;
+  audio.paused ? audio.play().catch(()=>{}) : audio.pause();
+}
+function seekBy(d) {
+  if (!NOW) return;
+  audio.currentTime = Math.max(0, Math.min((audio.duration || 0) - 1,
+                                           audio.currentTime + d));
+  updateMini();
+}
+function cycleRate() {
+  RATE = RATES[(RATES.indexOf(RATE) + 1) % RATES.length];
+  audio.playbackRate = RATE;
+  localStorage.setItem('rate', RATE);
+  document.getElementById('m-rate').textContent = RATE + '×';
+}
+function closePlayer() {
+  savePosition(true);
+  audio.pause();
+  NOW = null;
+  closeMini();
+  render();
+}
+function closeMini() {
+  document.getElementById('mini').classList.remove('on');
+  document.body.classList.remove('playing');
+}
+
+function updateMini() {
+  if (!NOW) return;
+  const cur = audio.currentTime || 0, dur = audio.duration || NOW.result_seconds || 0;
+  document.getElementById('m-play').textContent = audio.paused ? '▶' : '❚❚';
+  document.getElementById('m-sub').textContent =
+    `${clock(cur)} / ${clock(dur)}${dur ? ` · ${clock(Math.max(0, dur - cur))} left` : ''}`;
+  if (!scrubbing && dur) {
+    document.getElementById('scrub').value = Math.round(cur / dur * 1000);
+  }
+}
+
+function savePosition(force) {
+  if (!NOW) return;
+  const now = Date.now();
+  if (!force && now - lastSave < 10000) return;
+  lastSave = now;
+  const cur = audio.currentTime || 0, dur = audio.duration || 0;
+  const finished = dur > 0 && cur >= dur - 30;
+  NOW.position = cur; NOW.finished = finished;
+  const body = JSON.stringify({position: cur, duration: dur, finished});
+  const url = `/api/playback/${NOW.key}`;
+  // sendBeacon survives the page being backgrounded or closed mid-episode.
+  if (navigator.sendBeacon) {
+    navigator.sendBeacon(url, new Blob([body], {type: 'application/json'}));
+  } else {
+    fetch(url, {method:'POST', headers:{'Content-Type':'application/json'},
+                body, keepalive:true}).catch(()=>{});
+  }
+}
+
+/* Lock screen, bluetooth and car controls. */
+function setMediaSession(ep) {
+  if (!('mediaSession' in navigator)) return;
+  navigator.mediaSession.metadata = new MediaMetadata({
+    title: ep.title || 'skipcast',
+    artist: ep.feed_title || 'skipcast',
+    album: ep.cut_speakers ? `${Math.round((ep.cut_seconds||0)/60)} min removed` : '',
+    artwork: [{src: '/icon.svg', sizes: '512x512', type: 'image/svg+xml'}],
+  });
+  const set = (a, fn) => { try { navigator.mediaSession.setActionHandler(a, fn); }
+                           catch (e) {} };
+  set('play', () => audio.play());
+  set('pause', () => audio.pause());
+  set('seekbackward', () => seekBy(-15));
+  set('seekforward', () => seekBy(30));
+  set('seekto', d => { if (d.seekTime != null) { audio.currentTime = d.seekTime; updateMini(); } });
+}
+
 audio.addEventListener('timeupdate', () => {
   if (stopAt !== null && audio.currentTime >= stopAt) {
     audio.pause(); stopAt = null;
     if (playingBtn) { playingBtn.classList.remove('primary'); playingBtn = null; }
+    return;
   }
+  if (NOW) { updateMini(); savePosition(false); }
 });
+audio.addEventListener('play', () => { updateMini(); if (NOW) setPlaybackState('playing'); });
+audio.addEventListener('pause', () => { updateMini(); savePosition(true);
+                                        if (NOW) setPlaybackState('paused'); });
+audio.addEventListener('ended', () => { savePosition(true); render(); });
+audio.addEventListener('error', () => { if (NOW) toast('Could not load that episode'); });
+function setPlaybackState(s) {
+  if ('mediaSession' in navigator) navigator.mediaSession.playbackState = s;
+}
+
+document.getElementById('scrub').addEventListener('input', e => {
+  scrubbing = true;
+  const dur = audio.duration || 0;
+  if (dur) document.getElementById('m-sub').textContent =
+    `${clock(e.target.value / 1000 * dur)} / ${clock(dur)}`;
+});
+document.getElementById('scrub').addEventListener('change', e => {
+  const dur = audio.duration || 0;
+  if (dur) audio.currentTime = e.target.value / 1000 * dur;
+  scrubbing = false;
+  updateMini();
+});
+window.addEventListener('pagehide', () => savePosition(true));
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden') savePosition(true);
+});
+RATE = parseFloat(localStorage.getItem('rate')) || 1;
 
 /* ---- data ------------------------------------------------------------- */
 async function refresh(silent) {
@@ -165,6 +348,7 @@ async function refresh(silent) {
     b.textContent = running.length;
     document.getElementById('hdr').textContent =
       `${STATE.feeds.length} podcast${STATE.feeds.length === 1 ? '' : 's'}`;
+    loadListen();
     if (!silent) render();
     else if (TAB === 'jobs' || (VIEW && VIEW.kind === 'job')) render();
     // Poll faster while something is working.
@@ -178,10 +362,60 @@ function render() {
   if (VIEW && VIEW.kind === 'feed') return renderFeed(VIEW);
   if (VIEW && VIEW.kind === 'episode') return renderEpisode(VIEW);
   if (VIEW && VIEW.kind === 'job') return renderJob(VIEW);
+  if (TAB === 'listen') return renderListen();
   if (TAB === 'feeds') return renderFeeds();
   if (TAB === 'add') return renderAdd();
   if (TAB === 'speakers') return renderSpeakers();
   if (TAB === 'jobs') return renderJobs();
+}
+
+let LISTEN = null;
+
+async function loadListen() {
+  try {
+    const d = await api('/api/episodes');
+    LISTEN = d.episodes;
+    // Keep the playing episode's live position rather than the stored one.
+    if (NOW) {
+      const fresh = LISTEN.find(e => e.key === NOW.key);
+      if (fresh) { fresh.position = NOW.position; NOW = fresh; }
+    }
+  } catch (e) { LISTEN = []; }
+  if (TAB === 'listen' && !VIEW) render();
+}
+
+function renderListen() {
+  if (LISTEN === null) {
+    el.innerHTML = '<div class="empty"><span class="spin"></span></div>';
+    return;
+  }
+  if (!LISTEN.length) {
+    el.innerHTML = `<div class="empty">Nothing to listen to yet.<br><br>
+      Add a podcast, then fetch an episode.<br><br>
+      <button class="btn primary" onclick="go('add')">Add a podcast</button></div>`;
+    return;
+  }
+  el.innerHTML = `<div class="card"><h2>Episodes</h2>` + LISTEN.map(e => {
+    const dur = e.result_seconds || 0;
+    const pos = e.position || 0;
+    const pct = dur ? Math.min(100, pos / dur * 100) : 0;
+    const playing = NOW && NOW.key === e.key;
+    const left = dur && pos > 30 && !e.finished
+      ? `${clock(Math.max(0, dur - pos))} left`
+      : (e.finished ? 'played' : clock(dur));
+    return `
+      <div class="item" onclick="playEpisode('${esc(e.key)}')" style="cursor:pointer">
+        <div class="row">
+          <div class="grow">
+            <div class="title" style="${playing ? 'color:var(--accent)' : ''}">
+              ${playing && !audio.paused ? '▶ ' : ''}${esc(e.title)}</div>
+            <div class="sub">${esc(e.feed_title || e.feed_slug)} · ${left}
+              ${e.cut_seconds ? `· ${mins(e.cut_seconds)} of ${esc(e.cut_speakers)} removed` : ''}</div>
+          </div>
+        </div>
+        ${pct > 1 && !e.finished ? `<div class="prog"><i style="width:${pct}%"></i></div>` : ''}
+      </div>`;
+  }).join('') + '</div>';
 }
 
 function renderFeeds() {
@@ -206,12 +440,17 @@ function renderFeeds() {
 function renderAdd() {
   el.innerHTML = `
     <div class="card">
+      <div class="sub">This tells <b>skipcast</b> which shows to download and cut.
+        It does not subscribe your phone — for that, open the podcast here once
+        it is added and use the feed link.</div>
+    </div>
+    <div class="card">
       <h2>${STATE.search_enabled ? 'Search for a podcast' : 'Add by RSS URL'}</h2>
       <div class="stack">
         ${STATE.search_enabled ? `
         <input type="search" id="q" placeholder="Podcast name…"
                autocapitalize="none" autocorrect="off">
-        <button class="btn primary" onclick="doSearch()">Search</button>` : ''}
+        <button class="btn primary" onclick="doSearch(this)">Search</button>` : ''}
         <div id="results"></div>
       </div>
     </div>
@@ -219,17 +458,18 @@ function renderAdd() {
       <h2>Add by RSS URL</h2>
       <div class="stack">
         <input type="text" id="url" placeholder="https://…/feed.xml"
-               autocapitalize="none" autocorrect="off">
-        <button class="btn" onclick="addUrl()">Subscribe</button>
+               autocapitalize="none" autocorrect="off" inputmode="url">
+        <button class="btn" onclick="addUrl(this)">Subscribe</button>
       </div>
     </div>`;
   const q = document.getElementById('q');
   if (q) q.addEventListener('keydown', e => { if (e.key === 'Enter') doSearch(); });
 }
 
-async function doSearch() {
-  const q = document.getElementById('q').value.trim();
-  if (!q) return;
+async function doSearch(btn) {
+  const field = document.getElementById('q');
+  const q = (field ? field.value : '').trim();
+  if (!q) { toast('Type a podcast name first'); if (field) field.focus(); return; }
   const box = document.getElementById('results');
   box.innerHTML = '<div class="empty"><span class="spin"></span> Searching…</div>';
   try {
@@ -247,22 +487,35 @@ async function doSearch() {
   } catch (e) { box.innerHTML = `<div class="empty">${esc(e.message)}</div>`; }
 }
 
-async function subscribe(url, btn) {
+async function subscribe(url, btn, label) {
+  // The server fetches and parses the feed before answering, which on a show
+  // with hundreds of episodes takes several seconds. Without feedback the tap
+  // looks like it did nothing, so say something immediately and keep saying it.
+  const original = btn ? btn.textContent : null;
   if (btn) { btn.disabled = true; btn.textContent = '…'; }
+  toast('Fetching feed…', 15000);
   try {
     const r = await api('/api/feeds', {method:'POST', body:{url}});
-    toast(`Added ${r.title || r.slug}`);
+    toast(r.already_subscribed ? `Already had ${r.title || r.slug}`
+                               : `Added ${r.title || r.slug}`);
     await refresh(true);
     openFeed(r.slug);
   } catch (e) {
-    toast(e.message);
-    if (btn) { btn.disabled = false; btn.textContent = 'Add'; }
+    toast(`Could not add it: ${e.message}`, 5000);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = original ?? (label || 'Add'); }
   }
 }
-const addUrl = () => {
-  const u = document.getElementById('url').value.trim();
-  if (u) subscribe(u, null);
-};
+
+// Declared as a function, not a const arrow, so inline onclick attributes
+// resolve it regardless of how the browser scopes global lexical bindings.
+function addUrl(btn) {
+  const field = document.getElementById('url');
+  const u = (field ? field.value : '').trim();
+  if (!u) { toast('Paste a feed URL first'); if (field) field.focus(); return; }
+  if (!/^https?:\/\//i.test(u)) { toast('That needs to start with http:// or https://'); return; }
+  subscribe(u, btn, 'Subscribe');
+}
 
 async function openFeed(slug) {
   VIEW = {kind:'feed', slug, data:null};
@@ -508,10 +761,14 @@ function syncTabs() {
   document.querySelectorAll('nav button').forEach(
     b => b.classList.toggle('on', b.dataset.tab === TAB));
 }
-function go(tab) { TAB = tab; VIEW = null; syncTabs(); render(); }
+function go(tab) {
+  TAB = tab; VIEW = null; syncTabs(); render();
+  if (tab === 'listen') loadListen();
+}
 document.querySelectorAll('nav button').forEach(
   b => b.onclick = () => go(b.dataset.tab));
 
+document.getElementById('m-rate').textContent = RATE + '×';
 refresh();
 </script></body></html>
 """

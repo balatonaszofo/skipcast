@@ -86,7 +86,7 @@ port = 8730
 # feed are built from this, so "localhost" works for testing on this machine
 # but must become the tailnet name before AntennaPod can fetch anything —
 # e.g. "http://your-machine.tailnet-name.ts.net:8730".
-base_url = "http://localhost:8730"
+base_url = "http://tamass-macbook-air.tailbb9c76.ts.net:8730"
 
 # The control panel at / lets you subscribe, poll, label speakers and set skip
 # flags from a phone browser over Tailscale. There is no auth, by design —
