@@ -349,8 +349,29 @@ def create_app(cfg: Config) -> FastAPI:
         cuts = row["cuts_path"]
         if cuts and Path(cuts).is_file():
             out["cut_log"] = json.loads(Path(cuts).read_text())["summary"]
+
+        summary = row["summary_path"]
+        out["summary"] = (
+            Path(summary).read_text() if summary and Path(summary).is_file() else None
+        )
+        transcript = row["transcript_path"]
+        out["has_transcript"] = bool(transcript and Path(transcript).is_file())
         c.close()
         return out
+
+    @app.get("/api/episodes/{key}/transcript")
+    def api_transcript(key: str):
+        _need_ui()
+        c = conn()
+        row = db.get_episode_by_key(c, key)
+        c.close()
+        path = Path(row["transcript_path"]) if row and row["transcript_path"] else None
+        if path is None or not path.is_file():
+            raise HTTPException(404, "no transcript for this episode")
+        from . import transcribe as stt
+
+        return Response(content=stt.as_text(json.loads(path.read_text())),
+                        media_type="text/plain; charset=utf-8")
 
     @app.post("/api/episodes/{key}/label")
     async def api_label(key: str, request: Request):
@@ -382,14 +403,15 @@ def create_app(cfg: Config) -> FastAPI:
     @app.post("/api/episodes/{key}/{action}")
     async def api_episode_job(key: str, action: str):
         _need_ui()
-        if action not in ("recut", "reprocess"):
+        if action not in ("recut", "reprocess", "summarize"):
             raise HTTPException(404, "unknown action")
         c = conn()
         row = db.get_episode_by_key(c, key)
         if row is None:
             c.close()
             raise HTTPException(404, "unknown episode")
-        label = ("Recut" if action == "recut" else "Reprocess")
+        label = {"recut": "Recut", "reprocess": "Reprocess",
+                 "summarize": "Summarise"}[action]
         jid = jobs.enqueue(c, action, key, f"{label} {(row['title'] or '')[:40]}")
         c.close()
         worker.poke()

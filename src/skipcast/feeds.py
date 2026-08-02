@@ -216,6 +216,11 @@ def render_feed(feed_row, episodes, base_url: str) -> str:
         audio_url = f"{base}/audio/{e['key']}.mp3"
         description = (e["description"] or "").rstrip()
         description += f"\n\n{cut_note(e)}"
+        # The summary goes into the feed too, so it shows up in whatever
+        # podcast app you use, not only the control panel.
+        summary_path = e["summary_path"] if "summary_path" in e.keys() else None
+        if summary_path and Path(summary_path).is_file():
+            description += "\n\n" + Path(summary_path).read_text().strip()
 
         out.append("<item>")
         out.append(f"<title>{escape(e['title'] or '(untitled)')}</title>")

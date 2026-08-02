@@ -77,6 +77,9 @@ CREATE TABLE IF NOT EXISTS episodes (
     result_seconds   REAL,
     cut_seconds      REAL,
     cut_speakers     TEXT,          -- comma separated names actually removed
+    transcript_path  TEXT,
+    summary_path     TEXT,
+    summary_model    TEXT,
     status           TEXT NOT NULL, -- pending|ready|failed|refused
     error            TEXT,
     created_at       TEXT NOT NULL,
@@ -270,7 +273,8 @@ def upsert_episode(conn: sqlite3.Connection, feed_id: int, key: str, guid: str,
     cols = ["title", "description", "link", "published", "published_ts",
             "enclosure_url", "enclosure_type", "source_path", "segments_path",
             "cut_path", "cuts_path", "original_seconds", "result_seconds",
-            "cut_seconds", "cut_speakers", "status", "error"]
+            "cut_seconds", "cut_speakers", "transcript_path", "summary_path",
+            "summary_model", "status", "error"]
     present = {k: fields[k] for k in cols if k in fields}
     row = get_episode_by_guid(conn, feed_id, guid)
     if row is None:

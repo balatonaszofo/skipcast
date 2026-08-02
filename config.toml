@@ -114,6 +114,29 @@ max_failures = 3
 # once would fight over the GPU and the database. Set 0 to poll only by hand.
 interval_hours = 6
 
+[transcribe]
+# Whisper runs locally via faster-whisper. ctranslate2 has no Metal backend, so
+# this is CPU-bound on Apple Silicon — budget roughly 6-8 min per 90-min episode
+# at "small", two to three times that at "medium".
+enabled = true
+model = "small"          # tiny | base | small | medium | large-v3
+compute_type = "int8"    # int8 is much faster on CPU; float32 is marginally better
+language = "en"          # empty string autodetects, at some cost in speed
+beam_size = 5
+
+[summary]
+# Summaries are written by the Claude API and need ANTHROPIC_API_KEY in the
+# environment. This is the one part of skipcast that talks to a cloud service;
+# set enabled = false to keep everything local (you still get the transcript).
+enabled = true
+model = "claude-opus-5"
+max_tokens = 8000
+effort = "high"          # low | medium | high | xhigh | max
+
+# "original" summarises the whole episode including the parts cut out, so you
+# can see what you skipped. "cut" summarises only what you will actually hear.
+scope = "original"
+
 [encode]
 # Re-encode rather than stream-copy. See cut.py for why.
 bitrate = "128k"

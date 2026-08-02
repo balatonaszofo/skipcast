@@ -85,6 +85,11 @@ PAGE = r"""<!doctype html>
   .switch input:checked + .slider { background:var(--bad); border-color:var(--bad); }
   .switch input:checked + .slider:before { transform:translateX(19px); background:#fff; }
   .empty { color:var(--muted); text-align:center; padding:26px 10px; font-size:14px; }
+  .md { font-size:14.5px; line-height:1.6; }
+  .md h3 { font-size:15px; margin:16px 0 6px; }
+  .md h4 { font-size:14px; margin:14px 0 5px; color:var(--accent); }
+  .md ul { margin:6px 0; padding-left:20px; }
+  .md li { margin-bottom:5px; }
   .toast { position:fixed; left:50%; transform:translateX(-50%); bottom:24px;
     background:var(--fg); color:var(--bg); padding:11px 17px; border-radius:10px;
     font-size:14px; z-index:100; max-width:88%; }
@@ -161,6 +166,18 @@ const esc = s => (s ?? '').toString().replace(/[&<>"']/g,
   c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const mins = s => s ? (s >= 3600 ? `${Math.floor(s/3600)}h ${Math.round(s%3600/60)}m`
                                  : `${Math.round(s/60)}m`) : '0m';
+/* Just enough Markdown for the summary's headings, bullets and bold. */
+function md(src) {
+  return esc(src)
+    .replace(/^### (.*)$/gm, '<h4>$1</h4>')
+    .replace(/^## (.*)$/gm, '<h3>$1</h3>')
+    .replace(/^# (.*)$/gm, '<h3>$1</h3>')
+    .replace(/\*\*(.+?)\*\*/g, '<b>$1</b>')
+    .replace(/^[-*] (.*)$/gm, '<li>$1</li>')
+    .replace(/(<li>[\s\S]*?<\/li>)(?!\s*<li>)/g, '<ul>$1</ul>')
+    .replace(/\n{2,}/g, '<br><br>');
+}
+
 const clock = t => { const h=Math.floor(t/3600), m=Math.floor(t%3600/60), s=Math.floor(t%60);
   return (h? h+':'+String(m).padStart(2,'0') : String(m))+':'+String(s).padStart(2,'0'); };
 
@@ -604,6 +621,21 @@ function renderEpisode(v) {
           : esc(e.error || e.status)}
       </div>
     </div>
+    ${e.summary ? `<div class="card">
+      <h2>Summary</h2>
+      <div class="md">${md(e.summary)}</div>
+      ${e.has_transcript ? `<div style="margin-top:11px">
+        <a class="btn" href="/api/episodes/${esc(e.key)}/transcript" target="_blank">Read transcript</a>
+      </div>` : ''}
+    </div>` : `<div class="card">
+      <h2>Summary</h2>
+      <div class="sub">Not summarised yet.
+        ${e.has_transcript ? 'Transcript is ready.' : ''}</div>
+      <button class="btn primary" style="margin-top:11px"
+        onclick="epJob('${esc(e.key)}','summarize')">Summarise this episode</button>
+      <div class="sub" style="margin-top:9px">Transcribes locally, then writes the
+        summary with Claude. Takes several minutes and needs ANTHROPIC_API_KEY set.</div>
+    </div>`}
     <div class="card">
       <h2>Who is in this episode</h2>
       <div class="sub" style="margin-bottom:11px">Tap ▶ to hear a voice, then name it.

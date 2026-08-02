@@ -265,6 +265,14 @@ class Worker:
                 entry = poller.entry_from_row(ep)
                 poller.process_entry(conn, self.cfg, feed, entry, force=True)
 
+            elif row["kind"] == "summarize":
+                ep = db.get_episode_by_key(conn, row["target"])
+                if ep is None:
+                    raise ValueError(f"no episode {row['target']}")
+                poller.transcribe_and_summarize(
+                    conn, self.cfg, ep, force=params.get("force", False)
+                )
+
             elif row["kind"] == "recut":
                 # Re-apply the cut rules using current skip flags, without
                 # re-downloading or re-diarizing.

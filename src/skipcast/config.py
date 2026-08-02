@@ -64,6 +64,24 @@ class PollConfig:
 
 
 @dataclass
+class TranscribeConfig:
+    enabled: bool = True
+    model: str = "small"
+    compute_type: str = "int8"
+    language: str = "en"
+    beam_size: int = 5
+
+
+@dataclass
+class SummaryConfig:
+    enabled: bool = True
+    model: str = "claude-opus-5"
+    max_tokens: int = 8000
+    effort: str = "high"
+    scope: str = "original"
+
+
+@dataclass
 class EncodeConfig:
     bitrate: str = "128k"
     channels: int = 1
@@ -79,6 +97,8 @@ class Config:
     encode: EncodeConfig = field(default_factory=EncodeConfig)
     serve: ServeConfig = field(default_factory=ServeConfig)
     poll: PollConfig = field(default_factory=PollConfig)
+    transcribe: TranscribeConfig = field(default_factory=TranscribeConfig)
+    summary: SummaryConfig = field(default_factory=SummaryConfig)
     source_path: Path | None = None
 
 
@@ -127,6 +147,8 @@ def load_config(explicit: Path | None = None) -> Config:
         encode=_fill(EncodeConfig, raw.get("encode", {})),
         serve=_fill(ServeConfig, raw.get("serve", {})),
         poll=_fill(PollConfig, raw.get("poll", {})),
+        transcribe=_fill(TranscribeConfig, raw.get("transcribe", {})),
+        summary=_fill(SummaryConfig, raw.get("summary", {})),
         source_path=path,
     )
 

@@ -145,6 +145,13 @@ def process_entry(conn, cfg: Config, feed_row, entry: feeds.Entry,
             "status": "ready",
             "error": None,
         })
+
+        # Transcript and summary come after the episode is already playable, so
+        # a failure here never costs you the audio.
+        if cfg.transcribe.enabled or cfg.summary.enabled:
+            row = db.get_episode_by_guid(conn, feed_row["id"], entry.guid)
+            transcribe_and_summarize(conn, cfg, row)
+
         return Outcome(key, entry.title, "ready",
                        f"{plan.cut_seconds / 60:.1f} min removed")
 
@@ -158,6 +165,79 @@ def process_entry(conn, cfg: Config, feed_row, entry: feeds.Entry,
                           {"status": "failed", "error": f"{type(exc).__name__}: {exc}"})
         _log(traceback.format_exc().strip().splitlines()[-1])
         return Outcome(key, entry.title, "failed", f"{type(exc).__name__}: {exc}")
+
+
+def transcribe_and_summarize(conn, cfg: Config, ep, force: bool = False) -> None:
+    """Transcribe an episode and summarise it. Never fatal to the episode.
+
+    Both stages are optional extras on top of a working cut, so a Whisper crash
+    or an API outage marks the episode's summary missing rather than failing an
+    episode whose audio is already fine.
+    """
+    from . import summarize as summarizer
+    from . import transcribe as stt
+
+    key = ep["key"]
+    segments_path = Path(ep["segments_path"] or "")
+    source = Path(ep["source_path"] or "")
+    if not segments_path.is_file() or not source.is_file():
+        return
+
+    ep_dir = _episode_dir(cfg)
+    transcript_path = ep_dir / f"{key}.transcript.json"
+    summary_path = ep_dir / f"{key}.summary.md"
+    doc = json.loads(segments_path.read_text())
+
+    if cfg.transcribe.enabled:
+        try:
+            if transcript_path.is_file() and not force:
+                _log("[poll]   reusing existing transcript")
+                transcript = stt.load(transcript_path)
+            else:
+                transcript = stt.transcribe_file(source, doc, cfg)
+                transcript_path.write_text(json.dumps(transcript, indent=2),
+                                           encoding="utf-8")
+            db.upsert_episode(conn, ep["feed_id"], key, ep["guid"],
+                              {"transcript_path": str(transcript_path)})
+        except Exception as exc:  # noqa: BLE001 — an extra, not the deliverable
+            _log(f"[poll]   transcription failed, skipping summary: {exc}")
+            return
+    elif transcript_path.is_file():
+        transcript = stt.load(transcript_path)
+    else:
+        return
+
+    if not cfg.summary.enabled:
+        return
+    if not summarizer.available():
+        _log("[poll]   ANTHROPIC_API_KEY not set — transcript kept, summary skipped")
+        return
+    if summary_path.is_file() and not force:
+        _log("[poll]   reusing existing summary")
+        db.upsert_episode(conn, ep["feed_id"], key, ep["guid"],
+                          {"summary_path": str(summary_path)})
+        return
+
+    cut_note = ""
+    if cfg.summary.scope == "original" and ep["cut_speakers"]:
+        cut_note = (
+            f"Summarise the whole episode, including the parts removed from the "
+            f"listener's edited copy ({ep['cut_speakers']}). The listener will "
+            f"not hear those parts, so cover them so they know what they skipped."
+        )
+    try:
+        _log("[poll]   summarising")
+        result = summarizer.summarize(
+            stt.as_text(transcript), ep["title"] or "(untitled)", cfg,
+            show=None, note=cut_note,
+        )
+        summary_path.write_text(result.markdown, encoding="utf-8")
+        db.upsert_episode(conn, ep["feed_id"], key, ep["guid"], {
+            "summary_path": str(summary_path),
+            "summary_model": result.model,
+        })
+    except Exception as exc:  # noqa: BLE001
+        _log(f"[poll]   summary failed: {exc}")
 
 
 def entry_from_row(row) -> feeds.Entry:
