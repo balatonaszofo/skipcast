@@ -2,6 +2,9 @@
 __pycache__/
 *.pyc
 
+# API keys. Never commit this.
+.env
+
 # Working data: originals, diarization output, cuts, database.
 data/
 *.segments.json

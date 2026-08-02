@@ -125,12 +125,26 @@ language = "en"          # empty string autodetects, at some cost in speed
 beam_size = 5
 
 [summary]
-# Summaries are written by the Claude API and need ANTHROPIC_API_KEY in the
-# environment. This is the one part of skipcast that talks to a cloud service;
-# set enabled = false to keep everything local (you still get the transcript).
+# The one part of skipcast that talks to a cloud service. Set enabled = false
+# to keep everything local — you still get the searchable transcript.
 enabled = true
-model = "claude-opus-5"
+
+# gemini | anthropic. Keys go in the .env file next to this one, never in
+# ~/.zshrc — launchd does not read shell profiles, so the background service
+# would not see them. gemini reads GEMINI_API_KEY, anthropic ANTHROPIC_API_KEY.
+provider = "gemini"
+
+# Blank uses the provider's default: gemini-3.6-flash / claude-opus-5.
+# Roughly per 90-minute episode:
+#   gemini-2.5-flash       ~$0.01   cheapest that is still good
+#   gemini-3.6-flash       ~$0.05   current Flash, the default
+#   claude-opus-5          ~$0.15   best quality, most expensive
+# Gemini also has a free tier that may cover a single podcast entirely.
+model = ""
+
 max_tokens = 8000
+
+# Anthropic only; ignored by gemini.
 effort = "high"          # low | medium | high | xhigh | max
 
 # "original" summarises the whole episode including the parts cut out, so you

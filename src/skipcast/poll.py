@@ -209,8 +209,8 @@ def transcribe_and_summarize(conn, cfg: Config, ep, force: bool = False) -> None
 
     if not cfg.summary.enabled:
         return
-    if not summarizer.available():
-        _log("[poll]   ANTHROPIC_API_KEY not set — transcript kept, summary skipped")
+    if not summarizer.available(cfg):
+        _log(f"[poll]   {summarizer.missing_key_message(cfg.summary.provider)}")
         return
     if summary_path.is_file() and not force:
         _log("[poll]   reusing existing summary")
@@ -225,11 +225,16 @@ def transcribe_and_summarize(conn, cfg: Config, ep, force: bool = False) -> None
             f"listener's edited copy ({ep['cut_speakers']}). The listener will "
             f"not hear those parts, so cover them so they know what they skipped."
         )
+    # Show title and description are what let the model work out the genre.
+    feed = conn.execute("SELECT title, description FROM feeds WHERE id = ?",
+                        (ep["feed_id"],)).fetchone()
     try:
-        _log("[poll]   summarising")
+        _log(f"[poll]   summarising with {cfg.summary.provider}")
         result = summarizer.summarize(
             stt.as_text(transcript), ep["title"] or "(untitled)", cfg,
-            show=None, note=cut_note,
+            show=feed["title"] if feed else None,
+            show_description=feed["description"] if feed else None,
+            note=cut_note,
         )
         summary_path.write_text(result.markdown, encoding="utf-8")
         db.upsert_episode(conn, ep["feed_id"], key, ep["guid"], {

@@ -13,6 +13,34 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 CONFIG_FILENAME = "config.toml"
+ENV_FILENAME = ".env"
+
+
+def load_env_file(path: Path | None = None) -> None:
+    """Read KEY=value lines from .env into the environment.
+
+    API keys cannot live in ~/.zshrc — launchd does not read shell profiles, so
+    the background service would never see them — and a launchd plist is
+    world-readable. A gitignored file next to config.toml is the one location
+    that works for both the CLI and the service without exposing the secret.
+
+    Existing environment variables always win, so an explicit export still
+    overrides the file.
+    """
+    if path is None:
+        here = Path(__file__).resolve()
+        path = here.parent.parent.parent / ENV_FILENAME
+    if not path.is_file():
+        return
+    for raw in path.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
 
 
 @dataclass
@@ -75,9 +103,10 @@ class TranscribeConfig:
 @dataclass
 class SummaryConfig:
     enabled: bool = True
-    model: str = "claude-opus-5"
+    provider: str = "gemini"
+    model: str = ""          # blank resolves to the provider's default
     max_tokens: int = 8000
-    effort: str = "high"
+    effort: str = "high"     # anthropic only
     scope: str = "original"
 
 
@@ -121,6 +150,7 @@ def _fill(cls, table: dict):
 
 
 def load_config(explicit: Path | None = None) -> Config:
+    load_env_file()
     path = None
     if explicit is not None:
         path = Path(explicit).expanduser().resolve()
