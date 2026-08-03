@@ -249,6 +249,120 @@ def _cmd_speakers(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_person(args: argparse.Namespace) -> int:
+    from .config import load_config
+    from . import db, person
+
+    cfg = load_config(args.config)
+    conn = db.connect(cfg)
+    base = cfg.serve.base_url.rstrip("/")
+
+    if args.action == "add":
+        if not args.name:
+            print("error: person add needs a speaker name", file=sys.stderr)
+            conn.close()
+            return 1
+        try:
+            made = person.create(conn, cfg, args.name, args.slug,
+                                 args.min_minutes * 60)
+        except person.PersonError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            conn.close()
+            return 1
+        print(f"person feed: {made['slug']}")
+        print(f"  speaker:  {made['speaker']} ({made['profiles']} voice sample(s))")
+        print(f"  minimum:  {made['min_seconds'] / 60:.0f} min of talk per episode")
+        print(f"  feed url: {base}/persons/{made['slug']}.xml")
+        print(f"\nNext: skipcast person build --slug {made['slug']}")
+        conn.close()
+        return 0
+
+    if args.action == "remove":
+        if not args.slug:
+            print("error: person remove needs --slug", file=sys.stderr)
+            conn.close()
+            return 1
+        ok = db.remove_person_feed(conn, args.slug)
+        print("removed" if ok else f"no person feed with slug '{args.slug}'")
+        print("derived audio was left on disk" if ok else "")
+        conn.close()
+        return 0 if ok else 1
+
+    if args.action == "build":
+        rows = db.list_person_feeds(conn)
+        if args.slug:
+            rows = [r for r in rows if r["slug"] == args.slug]
+            if not rows:
+                print(f"error: no person feed with slug '{args.slug}'", file=sys.stderr)
+                conn.close()
+                return 1
+        if not rows:
+            print('No person feeds. Add one with: skipcast person add "<name>"')
+            conn.close()
+            return 0
+        for pf in rows:
+            report = person.build(conn, cfg, pf, limit=args.limit, force=args.force)
+            print()
+            print(f"{pf['slug']}: {report.count('ready')} episode(s) ready, "
+                  f"{report.count('skipped')} without them, "
+                  f"{report.count('failed')} failed")
+            for a in report.appearances:
+                if a.status == "ready":
+                    print(f"  {a.seconds / 60:5.1f} min  {a.episode_title[:52]}"
+                          f"  ({a.feed_slug})")
+            print(f"  feed url: {base}/persons/{pf['slug']}.xml")
+        conn.close()
+        return 0
+
+    rows = db.list_person_feeds(conn)
+    if not rows:
+        print('No person feeds. Add one with: skipcast person add "<name>"')
+        conn.close()
+        return 0
+    for r in rows:
+        print(r["slug"])
+        print(f"  speaker: {r['speaker']}")
+        print(f"  ready:   {r['ready_count']} appearance(s), "
+              f"{(r['total_seconds'] or 0) / 60:.0f} min total")
+        print(f"  minimum: {r['min_seconds'] / 60:.0f} min per episode")
+        print(f"  built:   {r['built_at'] or 'never'}")
+        print(f"  serve:   {base}/persons/{r['slug']}.xml")
+    conn.close()
+    return 0
+
+
+def _cmd_enroll(args: argparse.Namespace) -> int:
+    from .config import load_config
+    from . import db, enroll
+
+    cfg = load_config(args.config)
+    conn = db.connect(cfg)
+    try:
+        got = enroll.enroll_clip(conn, cfg, args.name, Path(args.audio),
+                                 start=args.start, end=args.end)
+    except (enroll.EnrollError, FileNotFoundError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        conn.close()
+        return 1
+
+    print()
+    print(f"enrolled: {got.name}")
+    print(f"  from:   {got.source}")
+    print(f"  speech: {got.seconds:.0f}s")
+    if got.matched_existing and got.matched_existing != got.name:
+        # Not an error — but a voice that already scores high against someone
+        # else is either the same person under two names or a threshold worth
+        # looking at, and both are better known now than after ten episodes.
+        print(f"\nnote: this voice scores {got.similarity_to_existing:.2f} against "
+              f"'{got.matched_existing}', who is already known.")
+        print("      If they are the same person, drop one with: "
+              f"skipcast speakers --forget \"{got.name}\"")
+    print(f"\n{got.name} will now be recognised in episodes polled from here on.")
+    print("Already-processed episodes need: skipcast poll --force, or a re-cut.")
+    conn.close()
+    return 0
+
+
 def _cmd_search(args: argparse.Namespace) -> int:
     from .config import load_config
     from . import db, search, timeline
@@ -320,10 +434,98 @@ def _cmd_index(args: argparse.Namespace) -> int:
         return 1
     poller.reindex_transcripts(conn, cfg, only_missing=args.missing)
     search.prune(conn)
+
+    from . import entities
+
+    entities.reindex_all(conn, log=lambda m: print(m, file=sys.stderr))
+
     stats = search.stats(conn)
+    ent = entities.stats(conn)
     print(f"\n{stats['passages']} passages from {stats['episodes']} episode(s) "
           "are searchable")
-    print("Try: skipcast search \"<something said>\"")
+    print(f"{ent['mentions']} specifics from {ent['episodes']} summarised "
+          "episode(s) are indexed")
+    print('Try: skipcast search "<something said>"  or  skipcast entities NVDA')
+    conn.close()
+    return 0
+
+
+def _cmd_entities(args: argparse.Namespace) -> int:
+    from .config import load_config
+    from . import db, entities
+
+    cfg = load_config(args.config)
+    conn = db.connect(cfg)
+    found = entities.lookup(conn, args.term or "", args.type or "", args.limit)
+    if not found:
+        have = entities.stats(conn)
+        if not have["mentions"]:
+            print("Nothing indexed yet. Summarise an episode, then: skipcast index")
+        else:
+            print(f"No match in {have['mentions']} indexed specifics.")
+            kinds = ", ".join(f"{k} ({n})" for k, n in entities.types(conn)[:8])
+            print(f"Types available: {kinds}")
+        conn.close()
+        return 0
+
+    for m in found:
+        stamp = ""
+        if m.at_seconds is not None:
+            stamp = f"  [{int(m.at_seconds) // 60}:{int(m.at_seconds) % 60:02d}]"
+        flag = f"  ({m.confidence})" if m.confidence and m.confidence != "firm" else ""
+        print(f"{m.value}  <{m.type}>{flag}")
+        if m.detail:
+            print(f"  {m.detail}")
+        who = f" — {m.speaker}" if m.speaker else ""
+        print(f"  {m.episode_title[:60]} ({m.feed_slug}){stamp}{who}")
+        print()
+    print(f"{len(found)} mention(s)")
+    conn.close()
+    return 0
+
+
+def _cmd_watch(args: argparse.Namespace) -> int:
+    from .config import load_config
+    from . import db, entities
+
+    cfg = load_config(args.config)
+    conn = db.connect(cfg)
+
+    if args.action == "add":
+        if not args.term:
+            print("error: watch add needs a term", file=sys.stderr)
+            conn.close()
+            return 1
+        entities.watch_add(conn, args.term)
+        print(f"watching: {args.term}")
+        conn.close()
+        return 0
+
+    if args.action == "remove":
+        ok = entities.watch_remove(conn, args.term or "")
+        print("removed" if ok else f"not watching '{args.term}'")
+        conn.close()
+        return 0 if ok else 1
+
+    hits = entities.watch_hits(conn)
+    if not hits:
+        print('Nothing on the watchlist. Add one with: skipcast watch add "NVDA"')
+        conn.close()
+        return 0
+
+    for h in hits:
+        flag = f"  {h['new']} new" if h["new"] else ""
+        print(f"{h['term']}  —  {h['total']} mention(s){flag}")
+        for m in h["mentions"][:args.limit]:
+            stamp = ""
+            if m.at_seconds is not None:
+                stamp = f" [{int(m.at_seconds) // 60}:{int(m.at_seconds) % 60:02d}]"
+            print(f"  {m.value}: {m.detail[:80]}")
+            print(f"    {m.episode_title[:55]} ({m.feed_slug}){stamp}")
+        print()
+    if args.seen:
+        n = entities.watch_mark_seen(conn)
+        print(f"marked {n} term(s) as seen")
     conn.close()
     return 0
 
@@ -653,6 +855,34 @@ def build_parser() -> argparse.ArgumentParser:
                           help="delete a speaker and all their voice profiles")
     speakers.set_defaults(func=_cmd_speakers)
 
+    person_p = sub.add_parser(
+        "person", help="feeds built from one voice across every subscribed show"
+    )
+    person_p.add_argument("action", choices=["list", "add", "build", "remove"],
+                          nargs="?", default="list")
+    person_p.add_argument("name", nargs="?", default=None,
+                          help='for add: the speaker, e.g. "Chamath Palihapatiya"')
+    person_p.add_argument("--slug", default=None,
+                          help="short name used in the served feed URL")
+    person_p.add_argument("--min-minutes", type=float, default=2.0,
+                          help="ignore appearances shorter than this (default 2)")
+    person_p.add_argument("--limit", type=int, default=None,
+                          help="for build: only the newest N episodes")
+    person_p.add_argument("--force", action="store_true",
+                          help="for build: redo appearances already built")
+    person_p.set_defaults(func=_cmd_person)
+
+    enroll_p = sub.add_parser(
+        "enroll", help="learn a voice from a sample clip, without an episode"
+    )
+    enroll_p.add_argument("name", help='who this is, e.g. "Sam Altman"')
+    enroll_p.add_argument("audio", help="an audio file of them speaking")
+    enroll_p.add_argument("--start", type=float, default=0.0,
+                          help="seconds into the file to start the sample")
+    enroll_p.add_argument("--end", type=float, default=None,
+                          help="seconds into the file to end the sample")
+    enroll_p.set_defaults(func=_cmd_enroll)
+
     search_p = sub.add_parser(
         "search", help="full-text search across every transcript"
     )
@@ -665,11 +895,35 @@ def build_parser() -> argparse.ArgumentParser:
     search_p.set_defaults(func=_cmd_search)
 
     index_p = sub.add_parser(
-        "index", help="build the search index from transcripts already on disk"
+        "index",
+        help="build the search and specifics indexes from what is on disk",
     )
     index_p.add_argument("--missing", action="store_true",
                          help="only episodes not indexed yet, rather than all")
     index_p.set_defaults(func=_cmd_index)
+
+    ent_p = sub.add_parser(
+        "entities",
+        help="tickers, dates, figures and claims, across every summary",
+    )
+    ent_p.add_argument("term", nargs="?", default=None,
+                       help="what to look for; omit to list everything")
+    ent_p.add_argument("--type", default=None,
+                       help="only this kind, e.g. ticker, figure, claim")
+    ent_p.add_argument("--limit", type=int, default=30)
+    ent_p.set_defaults(func=_cmd_entities)
+
+    watch_p = sub.add_parser(
+        "watch", help="terms to be told about when a summary mentions them"
+    )
+    watch_p.add_argument("action", choices=["list", "add", "remove"],
+                         nargs="?", default="list")
+    watch_p.add_argument("term", nargs="?", default=None)
+    watch_p.add_argument("--limit", type=int, default=5,
+                         help="mentions shown per term")
+    watch_p.add_argument("--seen", action="store_true",
+                         help="mark everything shown as seen")
+    watch_p.set_defaults(func=_cmd_watch)
 
     cut_p = sub.add_parser(
         "cut", help="produce an edited audio file with the skipped speakers removed"

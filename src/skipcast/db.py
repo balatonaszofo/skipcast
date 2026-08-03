@@ -104,6 +104,72 @@ CREATE TABLE IF NOT EXISTS speaker_feed_rules (
     PRIMARY KEY (speaker_id, feed_id)
 );
 
+-- A feed backed by a person rather than a URL: every appearance of one voice
+-- across every subscription, each episode reduced to just them. The rows in
+-- person_episodes are derived — the audio can be rebuilt from the source and
+-- the segments at any time, which is why they carry no metadata of their own
+-- beyond what the build produced.
+CREATE TABLE IF NOT EXISTS person_feeds (
+    id          INTEGER PRIMARY KEY,
+    slug        TEXT NOT NULL UNIQUE,
+    speaker_id  INTEGER NOT NULL UNIQUE REFERENCES speakers(id) ON DELETE CASCADE,
+    title       TEXT,
+    -- Appearances shorter than this are not worth a feed item. A guest who
+    -- says forty seconds is not "on the show".
+    min_seconds REAL NOT NULL DEFAULT 120,
+    created_at  TEXT NOT NULL,
+    built_at    TEXT
+);
+
+CREATE TABLE IF NOT EXISTS person_episodes (
+    id             INTEGER PRIMARY KEY,
+    person_feed_id INTEGER NOT NULL REFERENCES person_feeds(id) ON DELETE CASCADE,
+    episode_id     INTEGER NOT NULL REFERENCES episodes(id) ON DELETE CASCADE,
+    key            TEXT NOT NULL UNIQUE,
+    audio_path     TEXT,
+    cuts_path      TEXT,
+    seconds        REAL,        -- length of the derived audio
+    talk_seconds   REAL,        -- their diarized talk time in the source
+    status         TEXT NOT NULL,  -- ready | skipped | failed
+    error          TEXT,
+    created_at     TEXT NOT NULL,
+    updated_at     TEXT NOT NULL,
+    UNIQUE(person_feed_id, episode_id)
+);
+
+CREATE INDEX IF NOT EXISTS person_episodes_feed
+    ON person_episodes(person_feed_id, status);
+
+-- The specifics a summary extracted — tickers, dates, figures, claims —
+-- unpacked from the per-episode JSON into rows so they can be asked about
+-- across the whole library. Derived data: rebuilt from the .summary.json files
+-- by `skipcast index`.
+CREATE TABLE IF NOT EXISTS entities (
+    id         INTEGER PRIMARY KEY,
+    episode_id INTEGER NOT NULL REFERENCES episodes(id) ON DELETE CASCADE,
+    type       TEXT NOT NULL,
+    value      TEXT NOT NULL,
+    value_norm TEXT NOT NULL,      -- casefolded, for matching
+    detail     TEXT,
+    speaker    TEXT,
+    at_seconds REAL,               -- into the original audio
+    confidence TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS entities_norm ON entities(value_norm);
+CREATE INDEX IF NOT EXISTS entities_episode ON entities(episode_id);
+
+-- Terms worth being told about. seen_at is what makes "new since last time"
+-- mean anything; without it every check reports the same hits forever.
+CREATE TABLE IF NOT EXISTS watchlist (
+    id         INTEGER PRIMARY KEY,
+    term       TEXT NOT NULL,
+    term_norm  TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL,
+    seen_at    TEXT
+);
+
 -- Where you got to in each episode. Server-side rather than in the browser so
 -- your place survives clearing site data and follows you between devices.
 CREATE TABLE IF NOT EXISTS playback (
@@ -399,6 +465,104 @@ def feed_episodes(conn: sqlite3.Connection, feed_id: int, ready_only: bool = Tru
         sql += " AND status = 'ready'"
     sql += " ORDER BY published_ts DESC, id DESC"
     return conn.execute(sql, (feed_id,)).fetchall()
+
+
+# --- person feeds ----------------------------------------------------------
+def add_person_feed(conn: sqlite3.Connection, slug: str, speaker_id: int,
+                    title: str, min_seconds: float) -> int:
+    conn.execute(
+        """INSERT INTO person_feeds (slug, speaker_id, title, min_seconds, created_at)
+           VALUES (?,?,?,?,?)
+           ON CONFLICT(speaker_id) DO UPDATE SET
+               slug = excluded.slug, title = excluded.title,
+               min_seconds = excluded.min_seconds""",
+        (slug, speaker_id, title, min_seconds, _now()),
+    )
+    conn.commit()
+    return conn.execute(
+        "SELECT id FROM person_feeds WHERE speaker_id = ?", (speaker_id,)
+    ).fetchone()["id"]
+
+
+def list_person_feeds(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    return conn.execute(
+        """SELECT p.*, s.name AS speaker,
+                  (SELECT COUNT(*) FROM person_episodes pe
+                    WHERE pe.person_feed_id = p.id AND pe.status = 'ready')
+                    AS ready_count,
+                  (SELECT COALESCE(SUM(pe.seconds), 0) FROM person_episodes pe
+                    WHERE pe.person_feed_id = p.id AND pe.status = 'ready')
+                    AS total_seconds
+             FROM person_feeds p JOIN speakers s ON s.id = p.speaker_id
+            ORDER BY p.slug"""
+    ).fetchall()
+
+
+def get_person_feed(conn: sqlite3.Connection, slug: str):
+    return conn.execute(
+        """SELECT p.*, s.name AS speaker FROM person_feeds p
+             JOIN speakers s ON s.id = p.speaker_id WHERE p.slug = ?""",
+        (slug,),
+    ).fetchone()
+
+
+def person_episodes(conn: sqlite3.Connection, person_feed_id: int,
+                    ready_only: bool = True) -> list[sqlite3.Row]:
+    """Derived episodes joined to what they were made from."""
+    sql = """SELECT pe.*, e.title, e.guid, e.link, e.published, e.published_ts,
+                    e.description, e.original_seconds, f.slug AS feed_slug,
+                    f.title AS feed_title
+               FROM person_episodes pe
+               JOIN episodes e ON e.id = pe.episode_id
+               JOIN feeds f ON f.id = e.feed_id
+              WHERE pe.person_feed_id = ?"""
+    if ready_only:
+        sql += " AND pe.status = 'ready'"
+    sql += " ORDER BY e.published_ts DESC, pe.id DESC"
+    return conn.execute(sql, (person_feed_id,)).fetchall()
+
+
+def get_person_episode(conn: sqlite3.Connection, key: str):
+    return conn.execute("SELECT * FROM person_episodes WHERE key = ?",
+                        (key,)).fetchone()
+
+
+def upsert_person_episode(conn: sqlite3.Connection, person_feed_id: int,
+                          episode_id: int, key: str, fields: dict) -> None:
+    cols = ["audio_path", "cuts_path", "seconds", "talk_seconds", "status", "error"]
+    present = {k: fields[k] for k in cols if k in fields}
+    row = conn.execute(
+        "SELECT id FROM person_episodes WHERE person_feed_id = ? AND episode_id = ?",
+        (person_feed_id, episode_id),
+    ).fetchone()
+    if row is None:
+        names = ["person_feed_id", "episode_id", "key", "created_at", "updated_at",
+                 *present]
+        values = [person_feed_id, episode_id, key, _now(), _now(), *present.values()]
+        conn.execute(
+            f"INSERT INTO person_episodes ({','.join(names)}) "
+            f"VALUES ({','.join('?' * len(names))})",
+            values,
+        )
+    elif present:
+        sets = ", ".join(f"{k} = ?" for k in present)
+        conn.execute(
+            f"UPDATE person_episodes SET {sets}, updated_at = ? WHERE id = ?",
+            [*present.values(), _now(), row["id"]],
+        )
+    conn.commit()
+
+
+def mark_person_built(conn: sqlite3.Connection, person_feed_id: int) -> None:
+    conn.execute("UPDATE person_feeds SET built_at = ? WHERE id = ?",
+                 (_now(), person_feed_id))
+    conn.commit()
+
+
+def remove_person_feed(conn: sqlite3.Connection, slug: str) -> bool:
+    cur = conn.execute("DELETE FROM person_feeds WHERE slug = ?", (slug,))
+    conn.commit()
+    return cur.rowcount > 0
 
 
 def set_position(conn: sqlite3.Connection, key: str, position: float,

@@ -138,6 +138,7 @@ PAGE = r"""<!doctype html>
     <button data-tab="feeds">Podcasts</button>
     <button data-tab="add">Add</button>
     <button data-tab="speakers">Speakers</button>
+    <button data-tab="people">People</button>
     <button data-tab="jobs">Activity<span class="badge" id="jobbadge" style="display:none"></span></button>
   </nav>
 </header>
@@ -394,6 +395,7 @@ function render() {
   if (TAB === 'feeds') return renderFeeds();
   if (TAB === 'add') return renderAdd();
   if (TAB === 'speakers') return renderSpeakers();
+  if (TAB === 'people') return renderPeople();
   if (TAB === 'jobs') return renderJobs();
 }
 
@@ -447,35 +449,148 @@ function renderListen() {
 }
 
 /* ---- search ------------------------------------------------------------ */
-let SEARCH = {q: '', results: null, busy: false, error: '', count: 0};
+let SEARCH = {q: '', results: null, busy: false, error: '', count: 0,
+              mode: 'words'};
+let WATCH = null;
+
+/* Two things to search, and they answer different questions: the transcript
+   for what was said, the specifics for what a summary decided was worth
+   keeping. Same box, a toggle between them. */
+function searchModeHtml() {
+  const on = m => SEARCH.mode === m ? 'primary' : '';
+  return `<div class="wrap">
+    <button class="btn ${on('words')}" onclick="setSearchMode('words')">Words said</button>
+    <button class="btn ${on('facts')}" onclick="setSearchMode('facts')">Specifics</button>
+  </div>`;
+}
+
+function setSearchMode(m) {
+  SEARCH.mode = m; SEARCH.results = null; SEARCH.error = '';
+  render();
+  if (SEARCH.q) doTranscriptSearch();
+}
+
+function mentionHtml(r, key) {
+  const jump = r.at_cut == null ? ''
+    : (r.removed
+       ? `<button class="btn" onclick="play(this,'${esc(r.episode_key)}',${r.at_seconds},${r.at_seconds + 25})">
+            ▶ ${clock(r.at_seconds)} in the original</button>`
+       : `<button class="btn primary"
+            onclick="playEpisode('${esc(r.episode_key)}',${r.at_cut})">
+            ▶ ${clock(r.at_cut)}</button>`);
+  return `
+    <div class="item">
+      <div class="title wrapline">${esc(r.value)}
+        <span class="pill">${esc(r.type)}</span>
+        ${r.confidence && r.confidence !== 'firm'
+          ? `<span class="pill" style="color:var(--warn)">${esc(r.confidence)}</span>` : ''}
+      </div>
+      ${r.detail ? `<div class="sub wrapline" style="margin-top:4px">${esc(r.detail)}</div>` : ''}
+      <div class="sub" style="margin-top:4px">${r.speaker ? esc(r.speaker) + ' · ' : ''}${esc(r.episode_title)}</div>
+      <div class="wrap" style="margin-top:8px">${jump}
+        <button class="btn" onclick="openEpisode('${esc(r.episode_key)}')">Episode</button>
+      </div>
+    </div>`;
+}
+
+async function loadWatch() {
+  try { WATCH = (await api('/api/watchlist')).watchlist; }
+  catch (e) { WATCH = []; }
+  if (TAB === 'search' && !VIEW) render();
+}
+
+function watchHtml() {
+  if (WATCH === null) { loadWatch(); return ''; }
+  const totalNew = WATCH.reduce((a, w) => a + w.new, 0);
+  return `
+    <div class="card">
+      <h2>Watching${totalNew ? ` · ${totalNew} new` : ''}</h2>
+      ${WATCH.length ? WATCH.map(w => `
+        <div class="item">
+          <div class="row">
+            <div class="grow">
+              <div class="title">${esc(w.term)}
+                ${w.new ? `<span class="pill" style="color:var(--ok)">${w.new} new</span>` : ''}</div>
+              <div class="sub">${w.total} mention${w.total === 1 ? '' : 's'}</div>
+            </div>
+            <button class="btn danger" onclick='unwatch(${JSON.stringify(w.term)})'>✕</button>
+          </div>
+          ${w.mentions.slice(0, 3).map(m => `
+            <div class="sub wrapline" style="margin-top:6px">
+              ${esc(m.value)}${m.detail ? ' — ' + esc(m.detail.slice(0,110)) : ''}
+              <a class="back" style="margin:0 0 0 4px"
+                 onclick="openEpisode('${esc(m.episode_key)}')">episode</a>
+            </div>`).join('')}
+        </div>`).join('')
+      : '<div class="sub">Nothing watched yet. Add a ticker, a company or a name and skipcast will tell you when a summary mentions it.</div>'}
+      <div class="row" style="margin-top:11px">
+        <input type="text" class="grow" id="wterm" placeholder="Watch a term…"
+               autocapitalize="none">
+        <button class="btn" onclick="addWatch(this)">Watch</button>
+      </div>
+      ${totalNew ? `<button class="btn" style="margin-top:9px"
+        onclick="markWatchSeen()">Mark all as seen</button>` : ''}
+    </div>`;
+}
+
+async function addWatch(btn) {
+  const field = document.getElementById('wterm');
+  const term = (field ? field.value : '').trim();
+  if (!term) { toast('Type something to watch'); return; }
+  try {
+    await api('/api/watchlist', {method:'POST', body:{term}});
+    toast(`Watching ${term}`);
+    await loadWatch(); render();
+  } catch (e) { toast(e.message); }
+}
+
+async function unwatch(term) {
+  try {
+    await api('/api/watchlist/' + encodeURIComponent(term), {method:'DELETE'});
+    await loadWatch(); render();
+  } catch (e) { toast(e.message); }
+}
+
+async function markWatchSeen() {
+  try {
+    await api('/api/watchlist/seen', {method:'POST', body:{}});
+    await loadWatch(); render();
+  } catch (e) { toast(e.message); }
+}
 
 function renderSearch() {
   const idx = (STATE && STATE.search) || {passages: 0, episodes: 0};
   const feeds = (STATE.feeds || []).map(
     f => `<option value="${esc(f.slug)}">${esc(f.title || f.slug)}</option>`).join('');
+  const words = SEARCH.mode === 'words';
   el.innerHTML = `
     <div class="card">
       <div class="stack">
-        <input type="search" id="sq" placeholder="Anything anyone said…"
+        ${searchModeHtml()}
+        <input type="search" id="sq" placeholder="${words
+          ? 'Anything anyone said…' : 'A ticker, a company, a name…'}"
                value="${esc(SEARCH.q)}" autocapitalize="none" autocorrect="off"
                enterkeyhint="search">
         <div class="row">
-          <select id="sfeed" class="grow">
+          ${words ? `<select id="sfeed" class="grow">
             <option value="">All podcasts</option>${feeds}
-          </select>
+          </select>` : '<div class="grow"></div>'}
           <button class="btn primary" onclick="doTranscriptSearch()">Search</button>
         </div>
       </div>
       <div class="sub" style="margin-top:9px">
-        ${idx.episodes
-          ? `${idx.passages.toLocaleString()} passages from ${idx.episodes}
-             episode${idx.episodes === 1 ? '' : 's'} indexed.
-             Quote a phrase, or end a word with * for a prefix.`
-          : 'Nothing is indexed yet — episodes become searchable once transcribed.'}
+        ${words
+          ? (idx.episodes
+             ? `${idx.passages.toLocaleString()} passages from ${idx.episodes}
+                episode${idx.episodes === 1 ? '' : 's'} indexed.
+                Quote a phrase, or end a word with * for a prefix.`
+             : 'Nothing is indexed yet — episodes become searchable once transcribed.')
+          : 'What the summaries pulled out: tickers, figures, dates, claims. Leave it blank to see everything.'}
         <a class="back" style="margin:0 0 0 6px" onclick="rebuildIndex()">Rebuild</a>
       </div>
     </div>
-    <div id="sresults">${searchResultsHtml()}</div>`;
+    <div id="sresults">${searchResultsHtml()}</div>
+    ${words ? '' : watchHtml()}`;
   const box = document.getElementById('sq');
   if (box) box.addEventListener('keydown', e => {
     if (e.key === 'Enter') doTranscriptSearch();
@@ -490,6 +605,10 @@ function searchResultsHtml() {
   if (SEARCH.results === null) return '';
   if (!SEARCH.results.length) {
     return `<div class="empty">Nothing matched “${esc(SEARCH.q)}”.</div>`;
+  }
+  if (SEARCH.mode === 'facts') {
+    return `<div class="card"><h2>${SEARCH.count} specific${SEARCH.count === 1 ? '' : 's'}</h2>`
+      + SEARCH.results.map(r => mentionHtml(r)).join('') + '</div>';
   }
   return `<div class="card"><h2>${SEARCH.count} passage${SEARCH.count === 1 ? '' : 's'}</h2>` +
     SEARCH.results.map(r => `
@@ -516,12 +635,21 @@ async function doTranscriptSearch() {
   const sel = document.getElementById('sfeed');
   const q = (field ? field.value : '').trim();
   SEARCH.feed = sel ? sel.value : '';
-  if (!q) { toast('Type something to search for'); if (field) field.focus(); return; }
+  // A blank specifics search is a browse, not a mistake — it lists everything
+  // the summaries pulled out. A blank transcript search cannot mean anything.
+  if (!q && SEARCH.mode === 'words') {
+    toast('Type something to search for'); if (field) field.focus(); return;
+  }
   SEARCH.q = q; SEARCH.busy = true; SEARCH.error = ''; SEARCH.results = null;
   document.getElementById('sresults').innerHTML = searchResultsHtml();
   try {
-    let url = '/api/transcripts/search?q=' + encodeURIComponent(q);
-    if (SEARCH.feed) url += '&feed=' + encodeURIComponent(SEARCH.feed);
+    let url;
+    if (SEARCH.mode === 'facts') {
+      url = '/api/entities?q=' + encodeURIComponent(q);
+    } else {
+      url = '/api/transcripts/search?q=' + encodeURIComponent(q);
+      if (SEARCH.feed) url += '&feed=' + encodeURIComponent(SEARCH.feed);
+    }
     const d = await api(url);
     SEARCH.results = d.results; SEARCH.count = d.count;
   } catch (e) {
@@ -958,6 +1086,104 @@ function renderSpeakers() {
     </div>`;
 }
 
+/* ---- people ------------------------------------------------------------ */
+let PEOPLE = null;
+
+async function loadPeople() {
+  try { PEOPLE = (await api('/api/persons')).persons; }
+  catch (e) { PEOPLE = []; }
+  if (TAB === 'people' && !VIEW) render();
+}
+
+function renderPeople() {
+  if (PEOPLE === null) {
+    el.innerHTML = '<div class="empty"><span class="spin"></span></div>';
+    loadPeople();
+    return;
+  }
+  const taken = new Set(PEOPLE.map(p => p.speaker));
+  const available = STATE.speakers.filter(s => !taken.has(s.name));
+  el.innerHTML = `
+    <div class="card">
+      <div class="sub">A feed of one person: every episode any of your podcasts
+        has processed where that voice appears, with everyone else edited out.
+        Subscribe to it like any other show.</div>
+    </div>
+    ${PEOPLE.map(p => {
+      const url = `${STATE.base_url}/persons/${p.slug}.xml`;
+      return `
+      <div class="card">
+        <div class="row">
+          <div class="grow">
+            <div class="title">${esc(p.speaker)}</div>
+            <div class="sub">${p.ready_count} appearance${p.ready_count === 1 ? '' : 's'}
+              · ${mins(p.total_seconds)} total
+              · built ${p.built_at ? esc(p.built_at.slice(0,10)) : 'never'}</div>
+          </div>
+        </div>
+        <code style="display:block;margin-top:10px">${esc(url)}</code>
+        <div class="wrap" style="margin-top:11px">
+          <button class="btn primary" onclick="buildPerson('${esc(p.slug)}')">Rebuild</button>
+          <button class="btn" onclick='copy(${JSON.stringify(url)})'>Copy link</button>
+          <button class="btn danger" onclick="removePerson('${esc(p.slug)}')">Remove</button>
+        </div>
+        ${p.episodes.length ? `<div style="margin-top:6px">${p.episodes.map(e => `
+          <div class="item">
+            <div class="title wrapline" style="font-size:14.5px">${esc(e.title)}</div>
+            <div class="sub">${esc(e.feed_title || '')} · ${mins(e.seconds)} of them</div>
+          </div>`).join('')}</div>`
+        : `<div class="sub" style="margin-top:9px">Nothing built yet. Rebuild to
+           scan every processed episode for this voice.</div>`}
+      </div>`;
+    }).join('')}
+    <div class="card">
+      <h2>Follow someone</h2>
+      ${available.length ? `
+        <div class="sub" style="margin-bottom:11px">Pick a known voice. Building
+          scans every episode already processed — no new downloads.</div>
+        <div class="stack">
+          <select id="pname">${available.map(
+            s => `<option value="${esc(s.name)}">${esc(s.name)}</option>`).join('')}</select>
+          <button class="btn primary" onclick="addPerson(this)">Make a feed of them</button>
+        </div>`
+      : `<div class="sub">${STATE.speakers.length
+          ? 'Every known voice already has a feed.'
+          : 'No voices named yet. Open an episode and name the speakers you hear.'}</div>`}
+    </div>`;
+}
+
+async function addPerson(btn) {
+  const sel = document.getElementById('pname');
+  if (!sel) return;
+  btn.disabled = true;
+  try {
+    const r = await api('/api/persons', {method:'POST', body:{name: sel.value}});
+    toast(`Following ${r.speaker}`);
+    await loadPeople();
+    buildPerson(r.slug);
+  } catch (e) { toast(e.message); }
+  finally { btn.disabled = false; }
+}
+
+async function buildPerson(slug) {
+  try {
+    const r = await api(`/api/persons/${slug}/build`, {method:'POST', body:{}});
+    toast('Building — watch it in Activity');
+    await refresh(true);
+    openJob(r.job_id);
+  } catch (e) { toast(e.message); }
+}
+
+async function removePerson(slug) {
+  if (!confirm('Remove this person feed? The edited audio stays on disk.')) return;
+  try {
+    await api(`/api/persons/${slug}`, {method:'DELETE'});
+    toast('Removed');
+    await loadPeople();
+    render();
+  } catch (e) { toast(e.message); }
+}
+
 async function setSkip(name, skip) {
   try {
     await api(`/api/speakers/${encodeURIComponent(name)}/skip`, {method:'POST', body:{skip}});
@@ -1028,6 +1254,7 @@ function syncTabs() {
 function go(tab) {
   TAB = tab; VIEW = null; syncTabs(); render();
   if (tab === 'listen') loadListen();
+  if (tab === 'people') loadPeople();
 }
 document.querySelectorAll('nav button').forEach(
   b => b.onclick = () => go(b.dataset.tab));

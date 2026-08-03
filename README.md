@@ -347,6 +347,117 @@ rather than re-running Whisper — a re-summarise is one API call and about a
 minute, where re-transcribing a 90-minute episode is the better part of an hour
 of CPU for a transcript that has not changed.
 
+## Phase 5 — following a person
+
+Voice profiles have been durable and cross-show since Phase 1. This is what
+they were for.
+
+### Learning a voice without an episode
+
+Labelling works backwards for tracking someone: you cannot follow a person
+until they have already turned up in a show you subscribe to and been through
+the pipeline. Enrolment takes a clip instead.
+
+```bash
+uv run skipcast enroll "Sam Altman" interview.mp3 --start 120 --end 180
+```
+
+A minute of them talking is plenty; ten seconds is the floor. The embedding
+comes from the same diarization pipeline the episodes use — profiles are only
+comparable when they come out of the same model, so this deliberately does not
+reach for a lighter-weight embedder.
+
+Two things it refuses. A clip with more than one substantial voice in it, since
+an embedding blended across two people matches neither; and a clip too short to
+describe a person rather than a room. It also tells you when the voice already
+scores highly against someone known, which is how you catch the same person
+being enrolled twice under two spellings.
+
+### Person feeds
+
+```bash
+uv run skipcast person add "Chamath Palihapatiya" --min-minutes 2
+uv run skipcast person build --slug chamath-palihapatiya
+uv run skipcast person                     # list them, with their feed URLs
+```
+
+Subscribe to `<base_url>/persons/<slug>.xml` and you get every episode any of
+your podcasts has processed where that voice appears, each one reduced to just
+them. Items are titled `<show>: <episode>`, so you can tell whose show you are
+about to hear them on.
+
+Nothing is downloaded, diarized or transcribed for this. It reads the retained
+source audio and segments, re-matches identities, and re-cuts — which is why a
+rebuild is cheap and why enrolling someone today produces a feed of episodes
+you fetched last month. A poll that brings in new episodes refreshes every
+person feed automatically.
+
+### Keeping instead of cutting
+
+Person feeds are built by inverting the cut rules: name who to keep and
+everyone else goes. The arithmetic is the same, run against the complement, but
+two settings are not, and both live under `[cut]`:
+
+- `keep_only_min_cut_seconds` (8s) governs how long *everyone else* has to talk
+  before that stretch goes. `min_skip_seconds` is 15s because it is answering
+  "do not cut every mhm"; reused here it would leave most of an interview in,
+  since a question rarely runs that long. Short exchanges stay in deliberately
+  — an answer with the question removed is a person talking to nobody.
+- `keep_only_max_skip_fraction` (0.98) replaces the 50% ceiling. Removing 90%
+  of an episode is the job here rather than a symptom of a misidentified voice,
+  so this only has to catch "kept nothing at all".
+
+In practice, keeping one panellist from a 97-minute episode yields about 12
+minutes, of which ~87% is them and the rest is the questions they are
+answering.
+
+### One recording, two subscriptions
+
+If you subscribe to a show and to a mirror of it, every appearance would arrive
+twice. Person feeds collapse those: same title, same length to the second, one
+item — preferring the longest source, which is the least-edited copy. The guid
+is derived from skipcast's own key rather than the source episode's, so an
+episode appearing in both its show's feed and a person feed does not collide in
+your podcast app.
+
+## Phase 6 — the specifics, across everything
+
+Each summary already extracted its tickers, dates, figures and claims into a
+JSON block. Those lived one file per episode, which answers "what was in this
+episode" and nothing else. `skipcast index` unpacks them into rows so the whole
+library can be asked.
+
+```bash
+uv run skipcast entities NVDA
+uv run skipcast entities --type figure
+uv run skipcast entities                 # everything, newest episode first
+```
+
+Matching looks at the value and at the detail, so `Anthropic` finds both the
+entry named Anthropic and the settlement figure whose description mentions
+them. Normalisation is deliberately shallow — casefolding and whitespace only.
+`5.2%` and `$20B` are exactly the values that matter here, and stemming them
+into `52` and `20b` would make the index worse.
+
+### Watchlists
+
+```bash
+uv run skipcast watch add "NVDA"
+uv run skipcast watch                    # terms, with what is new since last time
+uv run skipcast watch --seen             # mark it all as read
+uv run skipcast watch remove "NVDA"
+```
+
+Nothing is sent anywhere. This records what is worth being told about and what
+you have already seen; the control panel's **Search → Specifics** tab shows the
+difference, with a count of what has arrived since you last looked. A term
+added today does not announce five years of back catalogue as news — anything
+indexed before the term existed counts as already seen.
+
+If you want this to reach your phone rather than waiting for you to open the
+panel, that needs a delivery channel — push, email, a message — and picking one
+is a decision skipcast has deliberately not made for you.
+
 ## Running it on another machine
 
 The repo carries code and config only. Everything in `data/` — downloads, cut

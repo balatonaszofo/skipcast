@@ -28,8 +28,8 @@ from .config import Config
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
     id          INTEGER PRIMARY KEY,
-    kind        TEXT NOT NULL,      -- poll | reprocess | summarize | recut | reindex
-    target      TEXT,               -- feed slug or episode key, null for reindex
+    kind        TEXT NOT NULL,      -- poll|reprocess|summarize|recut|reindex|person
+    target      TEXT,               -- feed slug, episode key, or person slug
     label       TEXT,               -- human description for the UI
     params      TEXT,               -- json
     status      TEXT NOT NULL,      -- queued | running | done | failed | cancelled
@@ -279,6 +279,15 @@ class Worker:
 
             elif row["kind"] == "reindex":
                 poller.reindex_transcripts(conn, self.cfg)
+
+            elif row["kind"] == "person":
+                from . import db as _db, person
+
+                pf = _db.get_person_feed(conn, row["target"])
+                if pf is None:
+                    raise ValueError(f"no person feed named {row['target']}")
+                person.build(conn, self.cfg, pf,
+                             force=params.get("force", False))
 
             elif row["kind"] == "recut":
                 # Re-apply the cut rules using current skip flags, without

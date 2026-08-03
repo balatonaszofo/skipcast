@@ -180,6 +180,17 @@ def index_transcript(conn, key: str, transcript: dict) -> None:
         _log(f"[poll]   could not index transcript: {exc}")
 
 
+def index_entities(conn, episode_id: int, data: dict) -> None:
+    """Unpack a summary's specifics into the cross-episode index."""
+    from . import entities
+
+    try:
+        n = entities.index_episode(conn, episode_id, data)
+        _log(f"[poll]   indexed {n} specifics")
+    except Exception as exc:  # noqa: BLE001 — the summary itself is already saved
+        _log(f"[poll]   could not index specifics: {exc}")
+
+
 def reindex_transcripts(conn, cfg: Config, only_missing: bool = False) -> int:
     """Index every transcript on disk. Safe to re-run.
 
@@ -306,6 +317,8 @@ def transcribe_and_summarize(conn, cfg: Config, ep, force: bool = False,
                                   if result.data else None),
             "summary_model": result.model,
         })
+        if result.data:
+            index_entities(conn, ep["id"], result.data)
     except Exception as exc:  # noqa: BLE001
         _log(f"[poll]   summary failed: {exc}")
 
@@ -399,4 +412,17 @@ def poll_feed(conn, cfg: Config, feed_row, limit: int | None = None,
             break
 
     db.mark_polled(conn, feed_row["id"])
+
+    # New episodes may contain someone a person feed is following. Building is
+    # idempotent and skips what it has already done, so this only costs
+    # anything when there is genuinely a new appearance to cut.
+    if report.count("ready"):
+        try:
+            from . import person
+
+            if db.list_person_feeds(conn):
+                person.build_all(conn, cfg)
+        except Exception as exc:  # noqa: BLE001 — never fail a poll over this
+            _log(f"[poll] person feeds could not be refreshed: {exc}")
+
     return report

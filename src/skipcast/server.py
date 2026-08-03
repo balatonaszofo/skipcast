@@ -131,6 +131,33 @@ def create_app(cfg: Config) -> FastAPI:
                         media_type="application/rss+xml; charset=utf-8",
                         headers={"cache-control": "no-cache"})
 
+    @app.api_route("/persons/{slug}.xml", methods=["GET", "HEAD"])
+    def person_feed(slug: str):
+        """One voice, every show they appear on."""
+        c = conn()
+        row = db.get_person_feed(c, slug)
+        if row is None:
+            c.close()
+            raise HTTPException(404, f"no person feed named {slug}")
+        episodes = db.person_episodes(c, row["id"], ready_only=True)
+        xml = feeds.render_person_feed(row, episodes, cfg.serve.base_url)
+        c.close()
+        return Response(content=xml,
+                        media_type="application/rss+xml; charset=utf-8",
+                        headers={"cache-control": "no-cache"})
+
+    @app.api_route("/persons/audio/{key}.mp3", methods=["GET", "HEAD"])
+    def person_audio(key: str, request: Request):
+        c = conn()
+        row = db.get_person_episode(c, key)
+        c.close()
+        if row is None or not row["audio_path"]:
+            raise HTTPException(404, "unknown appearance")
+        path = Path(row["audio_path"])
+        if not path.is_file():
+            raise HTTPException(410, "audio no longer on disk; rebuild this feed")
+        return _ranged(path, request, "audio/mpeg")
+
     @app.api_route("/audio/{key}.mp3", methods=["GET", "HEAD"])
     def audio(key: str, request: Request):
         c = conn()
@@ -566,6 +593,157 @@ def create_app(cfg: Config) -> FastAPI:
         if not ok:
             raise HTTPException(404, "unknown speaker")
         return {"ok": True}
+
+    def _mention_dicts(c, mentions) -> list[dict]:
+        """Mentions with a position in the edit, one timeline per episode."""
+        timelines: dict[str, timeline.Timeline] = {}
+        out = []
+        for m in mentions:
+            if m.episode_key not in timelines:
+                ep = db.get_episode_by_key(c, m.episode_key)
+                timelines[m.episode_key] = (
+                    timeline.for_episode(ep) if ep else timeline.identity_timeline()
+                )
+            tl = timelines[m.episode_key]
+            d = {
+                "value": m.value, "type": m.type, "detail": m.detail,
+                "speaker": m.speaker, "confidence": m.confidence,
+                "at_seconds": m.at_seconds, "episode_key": m.episode_key,
+                "episode_title": m.episode_title, "feed_slug": m.feed_slug,
+                "feed_title": m.feed_title,
+            }
+            if m.at_seconds is None:
+                d["at_cut"], d["removed"] = None, False
+            else:
+                d["at_cut"] = round(tl.to_cut(float(m.at_seconds)), 2)
+                d["removed"] = tl.was_cut(float(m.at_seconds))
+            out.append(d)
+        return out
+
+    @app.get("/api/entities")
+    def api_entities(q: str = "", type: str = "", limit: int = 50):
+        """Tickers, dates, figures and claims, across every summary."""
+        _need_ui()
+        from . import entities
+
+        c = conn()
+        found = entities.lookup(c, q, type, min(limit, 200))
+        out = {
+            "count": len(found),
+            "types": [{"type": t, "count": n} for t, n in entities.types(c)],
+            "results": _mention_dicts(c, found),
+        }
+        c.close()
+        return out
+
+    @app.get("/api/watchlist")
+    def api_watchlist(limit: int = 8):
+        _need_ui()
+        from . import entities
+
+        c = conn()
+        out = []
+        for h in entities.watch_hits(c, limit):
+            out.append({"term": h["term"], "new": h["new"], "total": h["total"],
+                        "mentions": _mention_dicts(c, h["mentions"])})
+        c.close()
+        return {"watchlist": out}
+
+    @app.post("/api/watchlist")
+    async def api_watch_add(request: Request):
+        _need_ui()
+        from . import entities
+
+        body = await request.json()
+        c = conn()
+        try:
+            entities.watch_add(c, (body.get("term") or "").strip())
+        except ValueError as exc:
+            c.close()
+            raise HTTPException(400, str(exc)) from exc
+        c.close()
+        return {"ok": True}
+
+    @app.delete("/api/watchlist/{term}")
+    def api_watch_remove(term: str):
+        _need_ui()
+        from . import entities
+
+        c = conn()
+        ok = entities.watch_remove(c, term)
+        c.close()
+        if not ok:
+            raise HTTPException(404, "not watching that")
+        return {"ok": True}
+
+    @app.post("/api/watchlist/seen")
+    def api_watch_seen():
+        _need_ui()
+        from . import entities
+
+        c = conn()
+        n = entities.watch_mark_seen(c)
+        c.close()
+        return {"ok": True, "terms": n}
+
+    @app.get("/api/persons")
+    def api_persons():
+        _need_ui()
+        c = conn()
+        out = []
+        for r in db.list_person_feeds(c):
+            d = _row(r)
+            d["episodes"] = [
+                {"key": e["key"], "title": e["title"], "feed_title": e["feed_title"],
+                 "seconds": e["seconds"], "talk_seconds": e["talk_seconds"],
+                 "published": e["published"]}
+                for e in db.person_episodes(c, r["id"], ready_only=True)
+            ]
+            out.append(d)
+        c.close()
+        return {"persons": out}
+
+    @app.post("/api/persons")
+    async def api_add_person(request: Request):
+        _need_ui()
+        from . import person
+
+        body = await request.json()
+        c = conn()
+        try:
+            made = person.create(c, cfg, (body.get("name") or "").strip(),
+                                 (body.get("slug") or "").strip() or None,
+                                 float(body.get("min_minutes") or 2) * 60)
+        except person.PersonError as exc:
+            c.close()
+            raise HTTPException(400, str(exc)) from exc
+        c.close()
+        return made
+
+    @app.delete("/api/persons/{slug}")
+    def api_remove_person(slug: str):
+        _need_ui()
+        c = conn()
+        ok = db.remove_person_feed(c, slug)
+        c.close()
+        if not ok:
+            raise HTTPException(404, "no such person feed")
+        return {"ok": True, "note": "derived audio was left on disk"}
+
+    @app.post("/api/persons/{slug}/build")
+    async def api_build_person(slug: str, request: Request):
+        _need_ui()
+        body = await request.json() if await request.body() else {}
+        c = conn()
+        row = db.get_person_feed(c, slug)
+        if row is None:
+            c.close()
+            raise HTTPException(404, "no such person feed")
+        jid = jobs.enqueue(c, "person", slug, f"Build {slug}",
+                           {"force": bool(body.get("force"))})
+        c.close()
+        worker.poke()
+        return {"job_id": jid}
 
     @app.post("/api/reindex")
     def api_reindex():

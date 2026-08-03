@@ -77,6 +77,21 @@ merge_adjacent_cuts = true
 # garbage.
 max_skip_fraction = 0.5
 
+# Keep-only mode: naming who to keep rather than who to cut, which is what a
+# person feed is built from. Both settings above are wrong for it, because it
+# is asking a different question — how much of everyone else goes, rather than
+# how much of one person.
+
+# How long everyone else has to talk uninterrupted before that stretch is
+# removed. Deliberately shorter than min_skip_seconds: at 15s almost nothing
+# would go, since a question rarely runs that long. Short exchanges stay in on
+# purpose — an answer with the question cut out is a person talking to nobody.
+keep_only_min_cut_seconds = 8.0
+
+# The equivalent ceiling. Removing 90% of an episode is the job here, not a
+# symptom, so this only has to catch "kept nothing at all".
+keep_only_max_skip_fraction = 0.98
+
 [serve]
 # The feed and the audio are served over Tailscale, so no auth layer.
 host = "0.0.0.0"

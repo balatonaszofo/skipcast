@@ -86,6 +86,25 @@ def to_wav(src: Path, dest: Path, sample_rate: int = 16000) -> Path:
     return dest
 
 
+def excerpt(src: Path, dest: Path, start: float = 0.0,
+            end: float | None = None) -> Path:
+    """Cut one span out of a file, re-encoding so the boundaries are exact.
+
+    -ss before -i seeks by keyframe, which for MP3 lands wherever the frame
+    grid happens to fall; putting it after decodes from the top and trims
+    precisely. Slower, but an enrolment clip that starts a second early can
+    take in the wrong voice entirely.
+    """
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    cmd = ["ffmpeg", "-nostdin", "-y", "-i", str(src), "-vn",
+           "-ss", f"{max(0.0, start):.3f}"]
+    if end is not None:
+        cmd += ["-to", f"{end:.3f}"]
+    cmd += ["-ac", "1", "-c:a", "pcm_s16le", str(dest)]
+    _run(cmd)
+    return dest
+
+
 def to_mp3(src: Path, dest: Path, bitrate: str = "128k", channels: int = 1) -> Path:
     """Transcode to the canonical serving format.
 

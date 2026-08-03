@@ -70,6 +70,12 @@ class Plan:
     skipped_labels: list[str] = field(default_factory=list)
     absorbed_slivers: int = 0
     dropped_keeps: int = 0
+    # "cut" removes the named speakers. "keep_only" removes everyone else,
+    # which is the same arithmetic run against the complement — but a
+    # different enough intent that the ceiling and the minimum length have
+    # their own settings.
+    mode: str = "cut"
+    kept_labels: list[str] = field(default_factory=list)
 
     @property
     def fraction(self) -> float:
@@ -104,36 +110,36 @@ def union(regions: list[Region]) -> list[Region]:
     return merged
 
 
+def match_labels(doc: dict, names: list[str]) -> list[str]:
+    """Cluster labels for a list of names or labels.
+
+    Accepts either a cluster label (SPEAKER_06) or a matched name ("Jason
+    Calacanis"), since both are things a caller reasonably has to hand.
+    """
+    wanted = {o.strip().casefold() for o in names if o and o.strip()}
+    return [
+        s["speaker_label"]
+        for s in doc["speakers"]
+        if s["speaker_label"].casefold() in wanted
+        or (s.get("matched_name") or "").casefold() in wanted
+    ]
+
+
 def resolve_skip_labels(doc: dict, overrides: list[str] | None = None) -> list[str]:
     """Which cluster labels to remove.
 
     Without overrides this is whatever Phase 1 matched to a speaker carrying
-    the skip flag. Overrides accept either a cluster label (SPEAKER_06) or a
-    matched name ("Jason Calacanis").
+    the skip flag.
     """
     if overrides:
-        wanted = {o.strip().casefold() for o in overrides}
-        return [
-            s["speaker_label"]
-            for s in doc["speakers"]
-            if s["speaker_label"].casefold() in wanted
-            or (s.get("matched_name") or "").casefold() in wanted
-        ]
+        return match_labels(doc, overrides)
     return [s["speaker_label"] for s in doc["speakers"] if s.get("skip")]
 
 
-def build_plan(doc: dict, cfg: Config, overrides: list[str] | None = None) -> Plan:
+def _skip_candidates(doc: dict, cfg: Config, labels: list[str], plan: Plan) -> list[Region]:
+    """Regions to remove when the named speakers are the ones being cut."""
     c = cfg.cut
-    duration = float(doc["duration"])
-    labels = resolve_skip_labels(doc, overrides)
     by_label = {s["speaker_label"]: s for s in doc["speakers"]}
-
-    plan = Plan(duration=duration, skipped_labels=labels)
-    if not labels:
-        plan.keeps = [Region(0.0, duration, "*")]
-        plan.result_seconds = duration
-        return plan
-
     candidates: list[Region] = []
     for label in labels:
         spk = by_label.get(label, {})
@@ -152,6 +158,96 @@ def build_plan(doc: dict, cfg: Config, overrides: list[str] | None = None) -> Pl
             ))
             if not keep_it:
                 candidates.append(region)
+    return candidates
+
+
+def _keep_only_candidates(doc: dict, cfg: Config, labels: list[str],
+                          plan: Plan, duration: float) -> list[Region]:
+    """Regions to remove when the named speakers are the only ones being kept.
+
+    The same arithmetic as the other direction, run against the complement:
+    glue the target's fragments back into turns, union them, and everything
+    outside that is a candidate for removal.
+
+    The minimum length is its own setting rather than min_skip_seconds. Here it
+    governs how much of *everyone else* has to run before it goes, and a
+    threshold tuned for "do not cut every mhm" is far too coarse — set at 15s it
+    would leave most of an interview in, because a question rarely runs that
+    long. Leaving short exchanges in is deliberate: an answer with the question
+    removed is a person talking to nobody.
+    """
+    c = cfg.cut
+    by_label = {s["speaker_label"]: s for s in doc["speakers"]}
+    mine: list[Region] = []
+    for label in labels:
+        mine.extend(
+            merge_same_speaker(doc["segments"], label, c.merge_gap_seconds)
+        )
+    kept = union(mine)
+
+    gaps: list[Region] = []
+    cursor = 0.0
+    for r in kept:
+        if r.start > cursor:
+            gaps.append(Region(cursor, r.start, "others"))
+        cursor = max(cursor, r.end)
+    if cursor < duration:
+        gaps.append(Region(cursor, duration, "others"))
+
+    minimum = c.keep_only_min_cut_seconds
+    candidates = []
+    for gap in gaps:
+        cut_it = gap.duration >= minimum
+        plan.decisions.append(Decision(
+            speaker_label="others",
+            matched_name=None,
+            similarity=0.0,
+            start=round(gap.start, 3),
+            end=round(gap.end, 3),
+            duration=round(gap.duration, 3),
+            decision="cut" if cut_it else "kept",
+            reason=("everyone but the target, long enough to cut" if cut_it
+                    else f"shorter than keep_only_min_cut_seconds ({minimum}s)"),
+        ))
+        if cut_it:
+            candidates.append(gap)
+
+    # Named for the log's benefit; the target speakers are what survives.
+    plan.kept_labels = list(labels)
+    return candidates
+
+
+def build_plan(doc: dict, cfg: Config, overrides: list[str] | None = None,
+               keep_only: list[str] | None = None) -> Plan:
+    """Decide what to remove.
+
+    `keep_only` inverts the question: instead of naming who to cut, name who to
+    keep and everyone else goes. That is what a person feed is built from.
+    """
+    c = cfg.cut
+    duration = float(doc["duration"])
+    mode = "keep_only" if keep_only else "cut"
+    labels = (match_labels(doc, keep_only) if keep_only
+              else resolve_skip_labels(doc, overrides))
+
+    plan = Plan(duration=duration, mode=mode)
+    if mode == "keep_only":
+        if not labels:
+            # Nothing to keep is not "keep everything" — it means the voice we
+            # were asked for is not in this episode, and an unfiltered episode
+            # served into a person feed would be a silent lie about what it is.
+            raise CutRefused(
+                "none of the speakers to keep appear in this episode: "
+                + ", ".join(keep_only)
+            )
+        candidates = _keep_only_candidates(doc, cfg, labels, plan, duration)
+    else:
+        plan.skipped_labels = labels
+        if not labels:
+            plan.keeps = [Region(0.0, duration, "*")]
+            plan.result_seconds = duration
+            return plan
+        candidates = _skip_candidates(doc, cfg, labels, plan)
 
     # Pull boundaries inward so we do not clip the kept speaker either side.
     # At the very start and end of the episode there is no adjacent kept
@@ -188,13 +284,26 @@ def build_plan(doc: dict, cfg: Config, overrides: list[str] | None = None) -> Pl
     plan.cuts = cuts
     plan.cut_seconds = sum(r.duration for r in cuts)
 
-    if plan.fraction > c.max_skip_fraction:
+    # The ceiling exists to catch a misidentified voice before it eats an
+    # episode. In keep-only mode removing 90% is the job, not a symptom, so it
+    # gets its own — high enough to allow a brief guest appearance, low enough
+    # that "kept nothing at all" still refuses.
+    ceiling = (c.keep_only_max_skip_fraction if plan.mode == "keep_only"
+               else c.max_skip_fraction)
+    setting = ("keep_only_max_skip_fraction" if plan.mode == "keep_only"
+               else "max_skip_fraction")
+    if plan.fraction > ceiling:
+        detail = (
+            "Check which speakers are flagged skip, and their match similarity."
+            if plan.mode == "cut" else
+            "That leaves almost nothing — check the voice was matched in this "
+            "episode rather than merely being the closest guess."
+        )
         raise CutRefused(
             f"the rules want to remove {plan.cut_seconds / 60:.1f} min of a "
             f"{duration / 60:.1f} min episode ({plan.fraction * 100:.1f}%), over the "
-            f"max_skip_fraction ceiling of {c.max_skip_fraction * 100:.0f}%. "
-            "Something is wrong — refusing rather than emitting garbage. "
-            "Check which speakers are flagged skip, and their match similarity."
+            f"{setting} ceiling of {ceiling * 100:.0f}%. "
+            f"Refusing rather than emitting garbage. {detail}"
         )
 
     # Keeps are the complement of the cuts.
@@ -311,8 +420,12 @@ def write_log(plan: Plan, doc: dict, cfg: Config, dest: Path) -> Path:
             "crossfade_seconds": c.crossfade_seconds,
             "max_skip_fraction": c.max_skip_fraction,
             "merge_adjacent_cuts": c.merge_adjacent_cuts,
+            "keep_only_min_cut_seconds": c.keep_only_min_cut_seconds,
+            "keep_only_max_skip_fraction": c.keep_only_max_skip_fraction,
         },
+        "mode": plan.mode,
         "skipped_labels": plan.skipped_labels,
+        "kept_labels": plan.kept_labels,
         "speakers": [
             {k: s.get(k) for k in
              ("speaker_label", "matched_name", "similarity", "skip",
@@ -337,6 +450,9 @@ def write_log(plan: Plan, doc: dict, cfg: Config, dest: Path) -> Path:
         "keeps": [asdict(r) for r in plan.keeps],
         "decisions": [asdict(d) for d in plan.decisions],
     }
+    # render() makes its own parent, but the log is written first — and for a
+    # person feed this is the first thing ever written to that directory.
+    dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     return dest
 

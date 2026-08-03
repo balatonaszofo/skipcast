@@ -73,6 +73,11 @@ class CutConfig:
     crossfade_seconds: float = 0.15
     max_skip_fraction: float = 0.5
     merge_adjacent_cuts: bool = True
+    # Keep-only mode, used by person feeds. Its own minimum and ceiling: it
+    # governs how much of everyone else goes, where the settings above govern
+    # how much of one person goes, and the right numbers are different.
+    keep_only_min_cut_seconds: float = 8.0
+    keep_only_max_skip_fraction: float = 0.98
 
 
 @dataclass

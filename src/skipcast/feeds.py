@@ -182,6 +182,78 @@ def cut_note(row) -> str:
             f"({pct:.0f}% of the original {orig / 60:.0f} min).")
 
 
+def render_person_feed(person_row, episodes, base_url: str) -> str:
+    """One person's appearances across every show, as a podcast feed.
+
+    Each item is a derived edit, so its title says which show it came from —
+    without that the feed is a list of episode names with no way to tell whose
+    show you are about to hear them on.
+    """
+    base = base_url.rstrip("/")
+    now = email.utils.formatdate(usegmt=True)
+    who = person_row["title"] or person_row["speaker"]
+    self_url = f"{base}/persons/{person_row['slug']}.xml"
+    blurb = (
+        f"Every appearance by {who} that skipcast has processed, across all "
+        "subscribed podcasts, with everyone else removed. Generated locally; "
+        "the timings are against skipcast's own copy of each episode."
+    )
+
+    out = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        '<rss version="2.0"'
+        ' xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd"'
+        ' xmlns:content="http://purl.org/rss/1.0/modules/content/"'
+        ' xmlns:atom="http://www.w3.org/2005/Atom">',
+        "<channel>",
+        f"<title>{escape(who)} (skipcast)</title>",
+        f"<link>{escape(base)}</link>",
+        f"<description>{_cdata(blurb)}</description>",
+        "<language>en</language>",
+        f"<lastBuildDate>{now}</lastBuildDate>",
+        f"<atom:link href={quoteattr(self_url)}"
+        ' rel="self" type="application/rss+xml"/>',
+        f"<itunes:author>{escape(who)}</itunes:author>",
+        "<itunes:block>Yes</itunes:block>",
+    ]
+
+    for e in episodes:
+        size = 0
+        if e["audio_path"] and Path(e["audio_path"]).is_file():
+            size = Path(e["audio_path"]).stat().st_size
+        audio_url = f"{base}/persons/audio/{e['key']}.mp3"
+        show = e["feed_title"] or e["feed_slug"]
+        talk = (e["talk_seconds"] or 0) / 60
+        orig = (e["original_seconds"] or 0) / 60
+        note = (
+            f"skipcast: {who} on {show}. {talk:.0f} min of them, edited out of "
+            f"the original {orig:.0f} min."
+        )
+        description = f"{note}\n\n{(e['description'] or '').rstrip()}"
+
+        out.append("<item>")
+        out.append(f"<title>{escape(show)}: {escape(e['title'] or '(untitled)')}</title>")
+        if e["link"]:
+            out.append(f"<link>{escape(e['link'])}</link>")
+        out.append(f"<description>{_cdata(description)}</description>")
+        # Derived from our own key, not the source episode's guid: the same
+        # episode can appear in this feed and in the show's own feed, and two
+        # items sharing a guid is how a podcast client loses one of them.
+        out.append(f'<guid isPermaLink="false">{escape(e["key"])}</guid>')
+        if e["published"]:
+            out.append(f"<pubDate>{escape(e['published'])}</pubDate>")
+        out.append(
+            f"<enclosure url={quoteattr(audio_url)} length=\"{size}\" "
+            'type="audio/mpeg"/>'
+        )
+        if e["seconds"]:
+            out.append(f"<itunes:duration>{_hms(e['seconds'])}</itunes:duration>")
+        out.append("</item>")
+
+    out.append("</channel></rss>")
+    return "\n".join(out)
+
+
 def render_feed(feed_row, episodes, base_url: str) -> str:
     base = base_url.rstrip("/")
     now = email.utils.formatdate(usegmt=True)
