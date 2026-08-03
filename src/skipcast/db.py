@@ -154,12 +154,32 @@ CREATE TABLE IF NOT EXISTS entities (
     detail     TEXT,
     speaker    TEXT,
     at_seconds REAL,               -- into the original audio
-    confidence TEXT,
+    confidence TEXT,               -- how firmly it was said
+    evidence   TEXT,               -- what was offered for it, if it is a claim
     created_at TEXT NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS entities_norm ON entities(value_norm);
 CREATE INDEX IF NOT EXISTS entities_episode ON entities(episode_id);
+
+-- Topics, unpacked from the same JSON as the entities. Stored with an end as
+-- well as a start: the summary only gives the moment each topic opens, so the
+-- span is derived from the next one, and deriving it once here is what makes a
+-- topic something you can cut out and listen to on its own.
+CREATE TABLE IF NOT EXISTS topics (
+    id           INTEGER PRIMARY KEY,
+    episode_id   INTEGER NOT NULL REFERENCES episodes(id) ON DELETE CASCADE,
+    position     INTEGER NOT NULL,     -- order within the episode
+    title        TEXT NOT NULL,
+    one_line     TEXT,
+    speakers     TEXT,                 -- comma separated, as the model gave them
+    start_seconds REAL,                -- into the original audio
+    end_seconds   REAL,
+    created_at   TEXT NOT NULL,
+    UNIQUE(episode_id, position)
+);
+
+CREATE INDEX IF NOT EXISTS topics_episode ON topics(episode_id);
 
 -- Terms worth being told about. seen_at is what makes "new since last time"
 -- mean anything; without it every check reports the same hits forever.
@@ -169,6 +189,21 @@ CREATE TABLE IF NOT EXISTS watchlist (
     term_norm  TEXT NOT NULL UNIQUE,
     created_at TEXT NOT NULL,
     seen_at    TEXT
+);
+
+-- Digests: one audio file assembled from topic-sized pieces of several
+-- episodes, to fit a stated number of minutes. Derived like everything else —
+-- the pieces record exactly what went in, so a digest can be explained after
+-- the fact and rebuilt if the audio is lost.
+CREATE TABLE IF NOT EXISTS digests (
+    id          INTEGER PRIMARY KEY,
+    key         TEXT NOT NULL UNIQUE,
+    title       TEXT,
+    minutes     REAL NOT NULL,
+    seconds     REAL,              -- what it actually came out at
+    audio_path  TEXT,
+    pieces      TEXT,              -- json: what went in, in order
+    created_at  TEXT NOT NULL
 );
 
 -- Where you got to in each episode. Server-side rather than in the browser so
@@ -206,6 +241,7 @@ def db_path(cfg: Config) -> Path:
 # project needs; anything structural rebuilds from the files on disk instead.
 ADDED_COLUMNS = {
     "episodes": [("summary_json_path", "TEXT"), ("interstitial_seconds", "REAL")],
+    "entities": [("evidence", "TEXT")],
 }
 
 

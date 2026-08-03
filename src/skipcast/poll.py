@@ -260,13 +260,15 @@ def apply_interstitials(conn, cfg: Config, ep, data: dict) -> float:
     return plan.interstitial_seconds
 
 
-def index_entities(conn, episode_id: int, data: dict) -> None:
-    """Unpack a summary's specifics into the cross-episode index."""
+def index_entities(conn, episode_id: int, data: dict,
+                   duration: float = 0.0) -> None:
+    """Unpack a summary's specifics and topics into the cross-episode index."""
     from . import entities
 
     try:
         n = entities.index_episode(conn, episode_id, data)
-        _log(f"[poll]   indexed {n} specifics")
+        t = entities.index_topics(conn, episode_id, data, duration)
+        _log(f"[poll]   indexed {n} specifics, {t} topics")
     except Exception as exc:  # noqa: BLE001 — the summary itself is already saved
         _log(f"[poll]   could not index specifics: {exc}")
 
@@ -398,7 +400,8 @@ def transcribe_and_summarize(conn, cfg: Config, ep, force: bool = False,
             "summary_model": result.model,
         })
         if result.data:
-            index_entities(conn, ep["id"], result.data)
+            index_entities(conn, ep["id"], result.data,
+                           float(ep["original_seconds"] or 0))
             try:
                 # Refetch: the summary write above changed the row this needs.
                 fresh = db.get_episode_by_key(conn, key)

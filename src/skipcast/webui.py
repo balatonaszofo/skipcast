@@ -181,6 +181,18 @@ function md(src) {
     .replace(/\n{2,}/g, '<br><br>');
 }
 
+/* What came out of an episode, named honestly. Two different promises — a
+   voice you asked to lose, and material that was never the show — and either
+   can be absent, so neither may be assumed when phrasing it. */
+function removedLabel(e) {
+  const ads = e.interstitial_seconds || 0;
+  const speech = (e.cut_seconds || 0) - ads;
+  const bits = [];
+  if (speech > 30) bits.push(`${mins(speech)} of ${esc(e.cut_speakers || 'flagged speakers')}`);
+  if (ads > 30) bits.push(`${mins(ads)} of ads`);
+  return bits.length ? bits.join(' and ') + ' removed' : '';
+}
+
 const clock = t => { const h=Math.floor(t/3600), m=Math.floor(t%3600/60), s=Math.floor(t%60);
   return (h? h+':'+String(m).padStart(2,'0') : String(m))+':'+String(s).padStart(2,'0'); };
 
@@ -414,6 +426,67 @@ async function loadListen() {
   if (TAB === 'listen' && !VIEW) render();
 }
 
+let DIGESTS = null;
+
+async function loadDigests() {
+  try { DIGESTS = (await api('/api/digests')).digests; }
+  catch (e) { DIGESTS = []; }
+  if (TAB === 'listen' && !VIEW) render();
+}
+
+/* The answer to "I have 35 minutes" — one file made of topic-sized pieces
+   from across the library. */
+function digestHtml() {
+  if (DIGESTS === null) { loadDigests(); return ''; }
+  const url = k => `${STATE.base_url}/digests/${k}.mp3`;
+  return `
+    <div class="card">
+      <h2>Digest</h2>
+      <div class="sub" style="margin-bottom:11px">Say how long you have and get
+        one thing to play, assembled from the best topics you have not heard.</div>
+      <div class="wrap">
+        ${[15, 30, 45, 60].map(m => `<button class="btn ${m === 30 ? 'primary' : ''}"
+          onclick="buildDigest(${m})">${m} min</button>`).join('')}
+      </div>
+      ${DIGESTS.map(d => `
+        <div class="item">
+          <div class="row">
+            <div class="grow">
+              <div class="title wrapline" style="font-size:14.5px">${esc(d.title)}</div>
+              <div class="sub">${d.pieces.length} topic${d.pieces.length === 1 ? '' : 's'}
+                from ${new Set(d.pieces.map(p => p.feed_slug)).size} show(s)</div>
+            </div>
+            <button class="btn danger" onclick="removeDigest('${esc(d.key)}')">✕</button>
+          </div>
+          <div class="wrap" style="margin-top:8px">
+            <a class="btn primary" href="${esc(url(d.key))}" target="_blank">▶ Play</a>
+            <button class="btn" onclick='copy(${JSON.stringify(url(d.key))})'>Copy link</button>
+          </div>
+          ${d.pieces.map(p => `<div class="sub wrapline" style="margin-top:5px">
+            ${Math.round(p.seconds / 60)}m · ${esc(p.topic)}
+            <span class="muted">${esc(p.feed_title || p.feed_slug)}</span></div>`).join('')}
+        </div>`).join('')}
+      ${DIGESTS.length ? `<div class="sub" style="margin-top:10px">Subscribe to them:
+        <code>${esc(STATE.base_url)}/digests.xml</code></div>` : ''}
+    </div>`;
+}
+
+async function buildDigest(minutes) {
+  try {
+    const r = await api('/api/digests', {method:'POST', body:{minutes}});
+    toast('Assembling — watch it in Activity');
+    await refresh(true);
+    openJob(r.job_id);
+  } catch (e) { toast(e.message); }
+}
+
+async function removeDigest(key) {
+  try {
+    await api('/api/digests/' + key, {method:'DELETE'});
+    await loadDigests(); render();
+  } catch (e) { toast(e.message); }
+}
+
 function renderListen() {
   if (LISTEN === null) {
     el.innerHTML = '<div class="empty"><span class="spin"></span></div>';
@@ -425,7 +498,7 @@ function renderListen() {
       <button class="btn primary" onclick="go('add')">Add a podcast</button></div>`;
     return;
   }
-  el.innerHTML = `<div class="card"><h2>Episodes</h2>` + LISTEN.map(e => {
+  el.innerHTML = digestHtml() + `<div class="card"><h2>Episodes</h2>` + LISTEN.map(e => {
     const dur = e.result_seconds || 0;
     const pos = e.position || 0;
     const pct = dur ? Math.min(100, pos / dur * 100) : 0;
@@ -440,7 +513,7 @@ function renderListen() {
             <div class="title" style="${playing ? 'color:var(--accent)' : ''}">
               ${playing && !audio.paused ? '▶ ' : ''}${esc(e.title)}</div>
             <div class="sub">${esc(e.feed_title || e.feed_slug)} · ${left}
-              ${e.cut_seconds ? `· ${mins(e.cut_seconds)} of ${esc(e.cut_speakers)} removed` : ''}</div>
+              ${removedLabel(e) ? '· ' + removedLabel(e) : ''}</div>
           </div>
         </div>
         ${pct > 1 && !e.finished ? `<div class="prog"><i style="width:${pct}%"></i></div>` : ''}
@@ -468,6 +541,20 @@ function setSearchMode(m) {
   SEARCH.mode = m; SEARCH.results = null; SEARCH.error = '';
   render();
   if (SEARCH.q) doTranscriptSearch();
+}
+
+/* What was offered for a claim in the episode — not a verdict on whether the
+   claim is true. Coloured by how much weight it carries, worded so it always
+   reads as "backed by". */
+const EVIDENCE_COLOUR = {trial: 'var(--ok)', observational: 'var(--ok)',
+                         mechanism: 'var(--warn)', anecdote: 'var(--warn)',
+                         authority: 'var(--warn)', none: 'var(--bad)'};
+
+function evidencePill(ev) {
+  if (!ev) return '';
+  const label = ev === 'none' ? 'asserted' : ev;
+  return `<span class="pill" style="color:${EVIDENCE_COLOUR[ev] || 'var(--muted)'}"
+    title="what the episode offered for this claim">${esc(label)}</span>`;
 }
 
 function mentionHtml(r, key) {
@@ -901,14 +988,7 @@ function renderEpisode(v) {
       <div class="sub" style="margin-top:6px">
         ${e.status === 'ready'
           ? `${mins(e.original_seconds)} → <b>${mins(e.result_seconds)}</b> ·
-             ${(() => {
-               const ads = e.interstitial_seconds || 0;
-               const speech = (e.cut_seconds || 0) - ads;
-               const bits = [];
-               if (speech > 30) bits.push(`${mins(speech)} of ${esc(e.cut_speakers || 'flagged speakers')}`);
-               if (ads > 30) bits.push(`${mins(ads)} of ads`);
-               return bits.length ? bits.join(' and ') + ' removed' : 'nothing removed';
-             })()}`
+             ${removedLabel(e) || 'nothing removed'}`
           : esc(e.error || e.status)}
       </div>
     </div>
@@ -1017,12 +1097,23 @@ function topicsHtml(e) {
   const topics = idx.topics.length ? `
     <div class="card">
       <h2>Topics</h2>
-      ${idx.topics.map(t => `
+      ${idx.topics.map((t, i) => `
         <div class="item">
           <div class="row">
             <div class="grow">
               <div class="title wrapline">${esc(t.title)}</div>
               ${t.one_line ? `<div class="sub wrapline">${esc(t.one_line)}</div>` : ''}
+              ${(() => {
+                /* Same story elsewhere this week — worth knowing before you
+                   listen to it a second time. */
+                const rel = (e.related || {})[String(i)] || [];
+                if (!rel.length) return '';
+                const names = [...new Set(rel.map(r => r.feed_title || r.feed_slug))];
+                return `<div class="sub wrapline" style="color:var(--warn);margin-top:4px">
+                  also covered by ${names.map(esc).join(', ')}
+                  <a class="back" style="margin:0 0 0 4px"
+                     onclick="openEpisode('${esc(rel[0].episode_key)}')">open</a></div>`;
+              })()}
             </div>
             ${jumpTopic(t)}
           </div>
@@ -1065,6 +1156,7 @@ function topicsHtml(e) {
                 <span class="pill">${esc(s.type)}</span>
                 ${s.confidence && s.confidence !== 'firm'
                   ? `<span class="pill" style="color:var(--warn)">${esc(s.confidence)}</span>` : ''}
+                ${evidencePill(s.evidence)}
               </div>
               ${s.detail ? `<div class="sub wrapline">${esc(s.detail)}</div>` : ''}
               ${s.speaker ? `<div class="sub">— ${esc(s.speaker)}</div>` : ''}
@@ -1287,7 +1379,7 @@ function syncTabs() {
 }
 function go(tab) {
   TAB = tab; VIEW = null; syncTabs(); render();
-  if (tab === 'listen') loadListen();
+  if (tab === 'listen') { loadListen(); loadDigests(); }
   if (tab === 'people') loadPeople();
 }
 document.querySelectorAll('nav button').forEach(

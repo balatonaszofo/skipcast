@@ -138,7 +138,9 @@ figure | claim | study | product | person | place | recommendation | other",
      "detail": "what was actually said about it, one sentence",
      "speaker": "who said it, or the cluster label if unnamed",
      "at": "12:34",
-     "confidence": "firm | hedged | uncertain"}
+     "confidence": "firm | hedged | uncertain",
+     "evidence": "trial | observational | mechanism | anecdote | authority | \
+none — only for claims that assert something about the world"}
   ],
   "interstitials": [
     {"kind": "ad | housekeeping | intro | outro | banter",
@@ -160,6 +162,14 @@ an episode with none gets an empty list.
 `hedged` for thinking out loud, `uncertain` where the transcript itself looks \
 garbled.
 - Attribute to a real transcript speaker, or omit `speaker`. Never invent a name.
+- `evidence` records what was *offered in the episode* for a claim, not what \
+exists in the world and not whether you think the claim is true. `trial` for a \
+controlled study, `observational` for a cohort, survey or dataset, `mechanism` \
+for a "this works because" explanation with nothing measured, `anecdote` for a \
+personal or single case, `authority` for "experts say" or an appeal to a name, \
+`none` where the claim was simply asserted. A hedged claim backed by a trial is \
+still `trial`. Omit the field entirely for anything that is not a claim about \
+the world — a ticker, a date, a product name.
 
 `interstitials` are stretches that are not the show: read advertisements and \
 sponsor spots, housekeeping (merch, live dates, "like and subscribe", patron \
@@ -298,6 +308,13 @@ def split_structured(text: str) -> tuple[str, dict]:
     return prose, normalize_index(data)
 
 
+# What was offered for a claim, strongest first. Ordered so a listener can be
+# told "nothing was offered for this" without the system pretending to judge
+# whether the claim itself is true.
+EVIDENCE_LEVELS = ("trial", "observational", "mechanism", "anecdote",
+                   "authority", "none")
+
+
 def normalize_index(data: dict) -> dict:
     """Resolve timestamps to seconds and drop entries that carry nothing.
 
@@ -326,7 +343,9 @@ def normalize_index(data: dict) -> dict:
         if not isinstance(s, dict) or not (s.get("value") or "").strip():
             continue
         confidence = str(s.get("confidence") or "").strip().lower()
+        evidence = str(s.get("evidence") or "").strip().lower()
         out["specifics"].append({
+            "evidence": evidence if evidence in EVIDENCE_LEVELS else "",
             "type": str(s.get("type") or "other").strip().lower()[:40],
             "value": str(s["value"]).strip()[:120],
             "detail": str(s.get("detail") or "").strip()[:500],

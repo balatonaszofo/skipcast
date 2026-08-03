@@ -456,7 +456,8 @@ def _cmd_entities(args: argparse.Namespace) -> int:
 
     cfg = load_config(args.config)
     conn = db.connect(cfg)
-    found = entities.lookup(conn, args.term or "", args.type or "", args.limit)
+    found = entities.lookup(conn, args.term or "", args.type or "", args.limit,
+                            evidence=args.evidence or "")
     if not found:
         have = entities.stats(conn)
         if not have["mentions"]:
@@ -473,6 +474,10 @@ def _cmd_entities(args: argparse.Namespace) -> int:
         if m.at_seconds is not None:
             stamp = f"  [{int(m.at_seconds) // 60}:{int(m.at_seconds) % 60:02d}]"
         flag = f"  ({m.confidence})" if m.confidence and m.confidence != "firm" else ""
+        # The evidence grade is what was offered in the episode, not a verdict
+        # on the claim, so it reads as "backed by" rather than "true".
+        if m.evidence:
+            flag += f"  [{m.evidence}]"
         print(f"{m.value}  <{m.type}>{flag}")
         if m.detail:
             print(f"  {m.detail}")
@@ -480,6 +485,93 @@ def _cmd_entities(args: argparse.Namespace) -> int:
         print(f"  {m.episode_title[:60]} ({m.feed_slug}){stamp}{who}")
         print()
     print(f"{len(found)} mention(s)")
+    conn.close()
+    return 0
+
+
+def _cmd_digest(args: argparse.Namespace) -> int:
+    from .audio import FFmpegFailed, FFmpegMissing
+    from .config import load_config
+    from . import cut as cutter, db, digest
+
+    cfg = load_config(args.config)
+    conn = db.connect(cfg)
+    base = cfg.serve.base_url.rstrip("/")
+
+    if args.action == "list":
+        rows = digest.recent(conn)
+        if not rows:
+            print("No digests yet. Build one with: skipcast digest build --minutes 30")
+            conn.close()
+            return 0
+        for r in rows:
+            pieces = json.loads(r["pieces"] or "[]")
+            print(f"{r['key']}  {(r['seconds'] or 0) / 60:.0f} min  "
+                  f"{len(pieces)} topic(s)  {r['created_at'][:10]}")
+            print(f"  {r['title']}")
+            print(f"  play: {base}/digests/{r['key']}.mp3")
+        conn.close()
+        return 0
+
+    if args.action == "remove":
+        ok = digest.remove(conn, args.key or "")
+        print("removed (audio left on disk)" if ok else "no such digest")
+        conn.close()
+        return 0 if ok else 1
+
+    try:
+        made = digest.build(conn, cfg, args.minutes, feed_slug=args.feed,
+                            unplayed_only=not args.include_played)
+    except digest.DigestError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        conn.close()
+        return 1
+    except (cutter.CutRefused, FFmpegFailed, FFmpegMissing) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        conn.close()
+        return 1
+
+    print()
+    print(f"digest: {made['title']}")
+    print(f"  length: {made['seconds'] / 60:.1f} min")
+    for p in made["pieces"]:
+        print(f"  {p['seconds'] / 60:5.1f} min  {p['topic'][:52]}  ({p['feed_slug']})")
+    print(f"\n  play: {base}/digests/{made['key']}.mp3")
+    print(f"  feed: {base}/digests.xml")
+    conn.close()
+    return 0
+
+
+def _cmd_overlaps(args: argparse.Namespace) -> int:
+    from .config import load_config
+    from . import db, overlap
+
+    cfg = load_config(args.config)
+    conn = db.connect(cfg)
+    clusters = overlap.across_library(conn, days=args.days, limit=args.limit)
+    if not clusters:
+        have = conn.execute("SELECT COUNT(*) n FROM topics").fetchone()["n"]
+        if not have:
+            print("No topics indexed yet. Summarise some episodes, then: "
+                  "skipcast index")
+        else:
+            print(f"No repeated stories among {have} topics in the last "
+                  f"{args.days} days.")
+        conn.close()
+        return 0
+
+    for k in clusters:
+        print(f"{k['count']} shows covered this:")
+        for s in k["shows"]:
+            stamp = ""
+            if s["start_seconds"] is not None:
+                stamp = (f"  [{int(s['start_seconds']) // 60}:"
+                         f"{int(s['start_seconds']) % 60:02d}]")
+            print(f"  {s['feed_slug']:<20} {s['topic'][:56]}{stamp}")
+        if k["shared"]:
+            print(f"  in common: {', '.join(k['shared'][:6])}")
+        print()
+    print(f"{len(clusters)} repeated stor{'y' if len(clusters) == 1 else 'ies'}")
     conn.close()
     return 0
 
@@ -910,8 +1002,33 @@ def build_parser() -> argparse.ArgumentParser:
                        help="what to look for; omit to list everything")
     ent_p.add_argument("--type", default=None,
                        help="only this kind, e.g. ticker, figure, claim")
+    ent_p.add_argument("--evidence", default=None,
+                       help="only claims backed this way: trial, observational, "
+                            "mechanism, anecdote, authority, none — or 'any' for "
+                            "everything that was graded")
     ent_p.add_argument("--limit", type=int, default=30)
     ent_p.set_defaults(func=_cmd_entities)
+
+    dig_p = sub.add_parser(
+        "digest", help="one file made of the best topics, to fit the time you have"
+    )
+    dig_p.add_argument("action", choices=["build", "list", "remove"],
+                       nargs="?", default="build")
+    dig_p.add_argument("--minutes", type=float, default=30.0,
+                       help="how long you have (default 30)")
+    dig_p.add_argument("--feed", default=None, help="only from this feed slug")
+    dig_p.add_argument("--include-played", action="store_true",
+                       help="consider episodes you have already finished")
+    dig_p.add_argument("--key", default=None, help="for remove")
+    dig_p.set_defaults(func=_cmd_digest)
+
+    ovl_p = sub.add_parser(
+        "overlaps", help="stories that more than one subscribed show covered"
+    )
+    ovl_p.add_argument("--days", type=int, default=21,
+                       help="how far apart two episodes can be and still count")
+    ovl_p.add_argument("--limit", type=int, default=20)
+    ovl_p.set_defaults(func=_cmd_overlaps)
 
     watch_p = sub.add_parser(
         "watch", help="terms to be told about when a summary mentions them"

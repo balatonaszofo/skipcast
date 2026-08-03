@@ -365,6 +365,14 @@ class Worker:
             elif row["kind"] == "reindex":
                 poller.reindex_transcripts(conn, self.cfg)
 
+            elif row["kind"] == "digest":
+                from . import digest as digester
+
+                digester.build(conn, self.cfg,
+                               minutes=params.get("minutes", 30),
+                               feed_slug=params.get("feed"),
+                               unplayed_only=not params.get("include_played"))
+
             elif row["kind"] == "person":
                 from . import db as _db, person
 

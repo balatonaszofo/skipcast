@@ -47,12 +47,59 @@ class Mention:
     detail: str
     speaker: str
     confidence: str
+    evidence: str
     at_seconds: float | None
     episode_key: str
     episode_title: str
     feed_slug: str
     feed_title: str
     published_ts: int
+
+
+def index_topics(conn: sqlite3.Connection, episode_id: int, data: dict,
+                 duration: float = 0.0) -> int:
+    """Replace this episode's topic rows, giving each one an end.
+
+    The summary says where a topic opens and nothing about where it closes, so
+    a topic runs until the next one starts and the last runs to the end of the
+    episode. That is an assumption, but it is the assumption the summary itself
+    is making by listing topics in order — and without an end a topic is not
+    something you can extract and listen to.
+    """
+    conn.execute("DELETE FROM topics WHERE episode_id = ?", (episode_id,))
+    topics = [
+        t for t in (data.get("topics") or [])
+        if (t.get("title") or "").strip()
+    ]
+    rows = []
+    for i, t in enumerate(topics):
+        start = t.get("at_seconds")
+        end = None
+        if start is not None:
+            for later in topics[i + 1:]:
+                if later.get("at_seconds") is not None:
+                    end = later["at_seconds"]
+                    break
+            if end is None and duration:
+                end = duration
+            # A topic that opens after the one following it is a bad timestamp,
+            # not a zero-length topic; leave the span off rather than invent it.
+            if end is not None and end <= start:
+                end = None
+        rows.append((
+            episode_id, i, str(t["title"]).strip()[:200],
+            str(t.get("one_line") or "").strip()[:400],
+            ", ".join(str(s) for s in (t.get("speakers") or []))[:200],
+            start, end, _now(),
+        ))
+    conn.executemany(
+        """INSERT INTO topics (episode_id, position, title, one_line, speakers,
+                               start_seconds, end_seconds, created_at)
+           VALUES (?,?,?,?,?,?,?,?)""",
+        rows,
+    )
+    conn.commit()
+    return len(rows)
 
 
 def index_episode(conn: sqlite3.Connection, episode_id: int, data: dict) -> int:
@@ -72,12 +119,14 @@ def index_episode(conn: sqlite3.Connection, episode_id: int, data: dict) -> int:
             (s.get("speaker") or "").strip(),
             s.get("at_seconds"),
             (s.get("confidence") or "").strip(),
+            (s.get("evidence") or "").strip(),
             _now(),
         ))
     conn.executemany(
         """INSERT INTO entities (episode_id, type, value, value_norm, detail,
-                                 speaker, at_seconds, confidence, created_at)
-           VALUES (?,?,?,?,?,?,?,?,?)""",
+                                 speaker, at_seconds, confidence, evidence,
+                                 created_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?)""",
         rows,
     )
     conn.commit()
@@ -89,10 +138,10 @@ def index_file(conn: sqlite3.Connection, episode_id: int, path: str | Path) -> i
 
 
 def reindex_all(conn: sqlite3.Connection, log=None) -> int:
-    """Rebuild from every .summary.json on disk."""
+    """Rebuild entities and topics from every .summary.json on disk."""
     total = 0
     rows = conn.execute(
-        "SELECT id, key, summary_json_path FROM episodes "
+        "SELECT id, key, summary_json_path, original_seconds FROM episodes "
         "WHERE summary_json_path IS NOT NULL"
     ).fetchall()
     for row in rows:
@@ -100,14 +149,17 @@ def reindex_all(conn: sqlite3.Connection, log=None) -> int:
         if not path.is_file():
             continue
         try:
-            n = index_file(conn, row["id"], path)
+            data = json.loads(path.read_text())
+            n = index_episode(conn, row["id"], data)
+            t = index_topics(conn, row["id"], data,
+                             float(row["original_seconds"] or 0))
         except ValueError as exc:
             if log:
                 log(f"[entities] {row['key']}: {exc}")
             continue
         total += n
         if log:
-            log(f"[entities] {row['key']}: {n} specifics")
+            log(f"[entities] {row['key']}: {n} specifics, {t} topics")
     return total
 
 
@@ -134,6 +186,7 @@ def _mentions(conn: sqlite3.Connection, where: str, params: list,
         Mention(
             value=r["value"], type=r["type"], detail=r["detail"] or "",
             speaker=r["speaker"] or "", confidence=r["confidence"] or "",
+            evidence=(r["evidence"] or "") if "evidence" in r.keys() else "",
             at_seconds=r["at_seconds"], episode_key=r["episode_key"],
             episode_title=r["episode_title"] or "", feed_slug=r["feed_slug"] or "",
             feed_title=r["feed_title"] or "",
@@ -144,7 +197,7 @@ def _mentions(conn: sqlite3.Connection, where: str, params: list,
 
 
 def lookup(conn: sqlite3.Connection, term: str = "", kind: str = "",
-           limit: int = 50) -> list[Mention]:
+           limit: int = 50, evidence: str = "") -> list[Mention]:
     """Mentions matching a term, newest episode first.
 
     Matches the value first and the detail second, so searching "Anthropic"
@@ -159,6 +212,15 @@ def lookup(conn: sqlite3.Connection, term: str = "", kind: str = "",
     if kind:
         clauses.append("n.type = ?")
         params.append(kind.strip().lower())
+    if evidence:
+        want = evidence.strip().lower()
+        if want == "any":
+            # Everything that was graded at all — the set of claims about the
+            # world, as opposed to tickers and dates.
+            clauses.append("n.evidence IS NOT NULL AND n.evidence != ''")
+        else:
+            clauses.append("n.evidence = ?")
+            params.append(want)
     return _mentions(conn, " AND ".join(clauses) or "1=1", params, limit)
 
 

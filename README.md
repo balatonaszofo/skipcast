@@ -516,6 +516,75 @@ so two concurrent jobs do not scramble each other's logs.
 The CLI does the slow half inline, because there is no worker running to hand it
 to. `skipcast poll` behaves exactly as it always did.
 
+## Phase 8 — the time you actually have
+
+### Digests
+
+```bash
+uv run skipcast digest build --minutes 30
+uv run skipcast digest list
+```
+
+One audio file, assembled from topic-sized pieces of several episodes, cut to
+fit. Subscribe to `<base_url>/digests.xml`, or hit a button on the Listen tab.
+
+Candidates are **topics**, not episodes — the spans indexed from each summary.
+A topic is the smallest unit that still makes sense alone: it opens with
+someone introducing a subject and runs until the next one starts.
+
+Selection is round-robin across episodes rather than a straight ranking. A
+ranking hands back forty minutes of whichever episode sorted first, which is
+not a digest of anything. One topic per episode, then a second, until the
+budget is full — and it keeps looking after the first piece that does not fit,
+because a shorter one further down still might.
+
+The audio comes from the **edited** file, not the source. A digest of a library
+that removes a speaker and the ads should not quietly reintroduce them, so each
+topic's span is mapped through that episode's cut log first. In practice this
+composes: a digest built here opened with a history topic at 0:00 of the edit
+that sits at 3:48 of the original, because the three ads before it were already
+gone.
+
+### Stories more than one show covered
+
+```bash
+uv run skipcast overlaps --days 21
+```
+
+Subscribe to five shows in one field and they converge. This compares each
+episode's topics against every other recent episode and reports the ones that
+are the same story. The episode page says it in place — *also covered by
+Latent Space* under the topic — so you know before you listen, not after.
+
+The comparison is **lexical, not semantic**: shared named things (a company, a
+figure, a person, an event) plus shared significant words in the titles. There
+is no embedding model here. That means it will not catch "the chip selloff"
+against "semiconductor correction", and adding embeddings is the honest way to
+improve it. What it does catch is the case that dominates a real library — the
+same named things discussed within a few days — at no dependency and no cost
+per episode.
+
+Scoring is conservative on purpose: two topics need either two shared entities
+or three shared title terms before they are compared at all. Better to miss a
+repeat than to claim two unrelated topics are the same.
+
+### What was offered for a claim
+
+Specifics now carry an `evidence` grade: `trial`, `observational`, `mechanism`,
+`anecdote`, `authority`, or `none`.
+
+```bash
+uv run skipcast entities --evidence any        # every graded claim
+uv run skipcast entities --evidence none       # asserted with nothing behind it
+uv run skipcast entities "sleep" --evidence trial
+```
+
+This records **what the episode offered**, not whether the claim is true and
+not what evidence exists in the world. A hedged claim backed by a trial is
+still `trial`; a confident claim with nothing behind it is `none`, displayed as
+*asserted*. The distinction matters most on health and science shows, where the
+hedging reliably gets lost between the studio and the listener's memory.
+
 ## Running it on another machine
 
 The repo carries code and config only. Everything in `data/` — downloads, cut

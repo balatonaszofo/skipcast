@@ -131,6 +131,31 @@ def create_app(cfg: Config) -> FastAPI:
                         media_type="application/rss+xml; charset=utf-8",
                         headers={"cache-control": "no-cache"})
 
+    @app.api_route("/digests.xml", methods=["GET", "HEAD"])
+    def digest_feed():
+        from . import digest as digester
+
+        c = conn()
+        xml = feeds.render_digest_feed(digester.recent(c, 50), cfg.serve.base_url)
+        c.close()
+        return Response(content=xml,
+                        media_type="application/rss+xml; charset=utf-8",
+                        headers={"cache-control": "no-cache"})
+
+    @app.api_route("/digests/{key}.mp3", methods=["GET", "HEAD"])
+    def digest_audio(key: str, request: Request):
+        from . import digest as digester
+
+        c = conn()
+        row = digester.get(c, key)
+        c.close()
+        if row is None or not row["audio_path"]:
+            raise HTTPException(404, "unknown digest")
+        path = Path(row["audio_path"])
+        if not path.is_file():
+            raise HTTPException(410, "digest audio no longer on disk; rebuild it")
+        return _ranged(path, request, "audio/mpeg")
+
     @app.api_route("/persons/{slug}.xml", methods=["GET", "HEAD"])
     def person_feed(slug: str):
         """One voice, every show they appear on."""
@@ -486,6 +511,26 @@ def create_app(cfg: Config) -> FastAPI:
             except ValueError:
                 pass
 
+        # Where else this week's topics turned up. Attached per topic position
+        # so the UI can say it next to the topic rather than as a footnote.
+        out["related"] = {}
+        if out["index"]:
+            from . import overlap
+
+            try:
+                out["related"] = {
+                    str(pos): [
+                        {"episode_key": r.episode_key, "feed_title": r.feed_title,
+                         "feed_slug": r.feed_slug, "topic": r.topic_title,
+                         "score": r.score, "shared": r.shared,
+                         "published_ts": r.published_ts}
+                        for r in rel
+                    ]
+                    for pos, rel in overlap.for_episode(c, key).items()
+                }
+            except Exception:  # noqa: BLE001 — an annotation, not the page
+                pass
+
         transcript = row["transcript_path"]
         out["has_transcript"] = bool(transcript and Path(transcript).is_file())
         c.close()
@@ -635,6 +680,60 @@ def create_app(cfg: Config) -> FastAPI:
         }
         c.close()
         return out
+
+    @app.get("/api/digests")
+    def api_digests():
+        _need_ui()
+        from . import digest as digester
+
+        c = conn()
+        out = []
+        for r in digester.recent(c, 30):
+            d = _row(r)
+            try:
+                d["pieces"] = json.loads(r["pieces"] or "[]")
+            except ValueError:
+                d["pieces"] = []
+            out.append(d)
+        c.close()
+        return {"digests": out}
+
+    @app.post("/api/digests")
+    async def api_build_digest(request: Request):
+        _need_ui()
+        body = await request.json() if await request.body() else {}
+        c = conn()
+        jid = jobs.enqueue(c, "digest", None,
+                           f"Digest {float(body.get('minutes') or 30):g} min",
+                           {"minutes": float(body.get("minutes") or 30),
+                            "feed": body.get("feed") or None,
+                            "include_played": bool(body.get("include_played"))})
+        c.close()
+        worker.poke()
+        return {"job_id": jid}
+
+    @app.delete("/api/digests/{key}")
+    def api_remove_digest(key: str):
+        _need_ui()
+        from . import digest as digester
+
+        c = conn()
+        ok = digester.remove(c, key)
+        c.close()
+        if not ok:
+            raise HTTPException(404, "no such digest")
+        return {"ok": True, "note": "audio was left on disk"}
+
+    @app.get("/api/overlaps")
+    def api_overlaps(days: int = 21, limit: int = 40):
+        """Stories that more than one show covered."""
+        _need_ui()
+        from . import overlap
+
+        c = conn()
+        out = overlap.across_library(c, days=days, limit=min(limit, 100))
+        c.close()
+        return {"days": days, "count": len(out), "clusters": out}
 
     @app.get("/api/watchlist")
     def api_watchlist(limit: int = 8):

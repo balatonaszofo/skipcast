@@ -197,6 +197,80 @@ def cut_note(row) -> str:
             f"({pct:.0f}% of the original {orig / 60:.0f} min).")
 
 
+def render_digest_feed(digests, base_url: str) -> str:
+    """The digests, as a feed to subscribe to.
+
+    Each item lists what went into it, because a digest is the one thing here
+    whose contents are not obvious from its title — and skipping a piece you
+    are not interested in needs to be possible from the description.
+    """
+    import json as _json
+
+    base = base_url.rstrip("/")
+    now = email.utils.formatdate(usegmt=True)
+    self_url = f"{base}/digests.xml"
+    blurb = (
+        "Digests assembled by skipcast: the best topics from across your "
+        "subscriptions, cut to fit the time you had."
+    )
+
+    out = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        '<rss version="2.0"'
+        ' xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd"'
+        ' xmlns:atom="http://www.w3.org/2005/Atom">',
+        "<channel>",
+        "<title>skipcast digests</title>",
+        f"<link>{escape(base)}</link>",
+        f"<description>{_cdata(blurb)}</description>",
+        "<language>en</language>",
+        f"<lastBuildDate>{now}</lastBuildDate>",
+        f"<atom:link href={quoteattr(self_url)}"
+        ' rel="self" type="application/rss+xml"/>',
+        "<itunes:block>Yes</itunes:block>",
+    ]
+
+    for d in digests:
+        size = 0
+        if d["audio_path"] and Path(d["audio_path"]).is_file():
+            size = Path(d["audio_path"]).stat().st_size
+        try:
+            pieces = _json.loads(d["pieces"] or "[]")
+        except ValueError:
+            pieces = []
+        lines = [f"{len(pieces)} topics, {(d['seconds'] or 0) / 60:.0f} minutes:", ""]
+        for p in pieces:
+            lines.append(
+                f"- {p['topic']} ({p['seconds'] / 60:.0f} min) — "
+                f"{p.get('feed_title') or p.get('feed_slug')}"
+            )
+            if p.get("one_line"):
+                lines.append(f"  {p['one_line']}")
+
+        out.append("<item>")
+        out.append(f"<title>{escape(d['title'] or 'digest')}</title>")
+        out.append(f"<description>{_cdata(chr(10).join(lines))}</description>")
+        out.append(f'<guid isPermaLink="false">{escape(d["key"])}</guid>')
+        try:
+            when = dt.datetime.fromisoformat(d["created_at"])
+            out.append(
+                f"<pubDate>{email.utils.format_datetime(when)}</pubDate>"
+            )
+        except (ValueError, TypeError):
+            pass
+        audio_url = f"{base}/digests/{d['key']}.mp3"
+        out.append(
+            f"<enclosure url={quoteattr(audio_url)} "
+            f'length="{size}" type="audio/mpeg"/>'
+        )
+        if d["seconds"]:
+            out.append(f"<itunes:duration>{_hms(d['seconds'])}</itunes:duration>")
+        out.append("</item>")
+
+    out.append("</channel></rss>")
+    return "\n".join(out)
+
+
 def render_person_feed(person_row, episodes, base_url: str) -> str:
     """One person's appearances across every show, as a podcast feed.
 

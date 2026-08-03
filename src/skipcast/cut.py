@@ -485,6 +485,59 @@ def render(src: Path, plan: Plan, cfg: Config, dest: Path) -> Path:
     return dest
 
 
+def stitch(pieces: list[tuple[Path, float, float]], cfg: Config,
+           dest: Path) -> Path:
+    """Join spans taken from *different* files into one.
+
+    render() cuts within a single episode; a digest crosses episodes, so each
+    piece is its own ffmpeg input. Everything else matches: the same crossfade
+    at each join, the same encoder settings, so a digest sounds like the rest
+    of the library rather than like a different product.
+    """
+    audio.require_ffmpeg()
+    if not pieces:
+        raise CutRefused("nothing to stitch")
+
+    crossfade = cfg.cut.crossfade_seconds
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    inputs: list[str] = []
+    parts: list[str] = []
+    for i, (path, start, end) in enumerate(pieces):
+        inputs += ["-i", str(path)]
+        parts.append(
+            f"[{i}:a]atrim=start={start:.4f}:end={end:.4f},"
+            f"asetpts=PTS-STARTPTS,aresample=44100[p{i}]"
+        )
+    if len(pieces) == 1:
+        parts.append("[p0]anull[out]")
+    else:
+        prev = "p0"
+        for i in range(1, len(pieces)):
+            label = "out" if i == len(pieces) - 1 else f"a{i}"
+            parts.append(
+                f"[{prev}][p{i}]acrossfade=d={crossfade}:c1=tri:c2=tri[{label}]"
+            )
+            prev = label
+
+    with tempfile.TemporaryDirectory(prefix="skipcast-digest-") as tmp:
+        graph_file = Path(tmp) / "graph.txt"
+        graph_file.write_text(";".join(parts))
+        cmd = [
+            "ffmpeg", "-nostdin", "-y", *inputs,
+            "-filter_complex_script", str(graph_file),
+            "-map", "[out]",
+            "-ac", str(cfg.encode.channels),
+            "-c:a", "libmp3lame",
+            "-b:a", cfg.encode.bitrate,
+            str(dest),
+        ]
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        if proc.returncode != 0:
+            tail = "\n".join(proc.stderr.strip().splitlines()[-20:])
+            raise audio.FFmpegFailed(f"digest failed:\n{tail}")
+    return dest
+
+
 def _decode(src: Path, dest: Path) -> Path:
     """Decode to PCM at the source rate, preserving channel count for now."""
     subprocess.run(
