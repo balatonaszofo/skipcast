@@ -175,10 +175,25 @@ def cut_note(row) -> str:
     cut = row["cut_seconds"] or 0
     if not cut:
         return "skipcast: nothing removed from this episode."
-    names = row["cut_speakers"] or "flagged speakers"
+    keys = row.keys()
+    ads = (row["interstitial_seconds"] or 0) if "interstitial_seconds" in keys else 0
     orig = row["original_seconds"] or 0
     pct = (cut / orig * 100) if orig else 0
-    return (f"skipcast: removed {cut / 60:.0f} min of {names} "
+
+    # Two different promises, so they are named separately: one is the voice
+    # you asked to have removed, the other is material that was never the show.
+    parts = []
+    speech = cut - ads
+    names = row["cut_speakers"] or ""
+    if speech > 30 and names:
+        parts.append(f"{speech / 60:.0f} min of {names}")
+    elif speech > 30:
+        parts.append(f"{speech / 60:.0f} min of flagged speakers")
+    if ads > 30:
+        parts.append(f"{ads / 60:.0f} min of ads and housekeeping")
+    if not parts:
+        parts.append(f"{cut / 60:.0f} min")
+    return (f"skipcast: removed {' and '.join(parts)} "
             f"({pct:.0f}% of the original {orig / 60:.0f} min).")
 
 

@@ -177,6 +177,35 @@ effort = "high"          # low | medium | high | xhigh | max
 # can see what you skipped. "cut" summarises only what you will actually hear.
 scope = "original"
 
+[interstitial]
+# Removing the parts that are not the show: read advertisements, housekeeping
+# (merch, live dates, patron thanks), and the scripted intro and outro.
+#
+# The ranges come from the same request that writes the summary — the
+# transcript is the expensive half of that call and sending it twice to ask a
+# second question would double the cost of every episode. That does mean this
+# needs [summary] enabled; with summaries off, nothing is detected.
+#
+# Because the ranges come from the transcript, and the transcript comes from
+# the audio, this runs as a second cut after the episode is already playable.
+enabled = true
+
+# Which kinds to act on: ad | housekeeping | intro | outro | banter.
+# "banter" is deliberately absent. It is the judgement the model is worst at
+# and the one where being wrong removes actual content — a digression you
+# found boring is still the show.
+remove = ["ad", "housekeeping", "intro", "outro"]
+
+# certain | likely | unsure. "certain" is an unmistakable read spot; "likely"
+# means the shape is right but a boundary is fuzzy. Lowering this to "unsure"
+# will cut things that are not adverts.
+min_confidence = "likely"
+
+# Refuse the lot if they add up to more than this share of the episode. A
+# podcast is not 40% advertising; a number that high means the model has
+# started marking the show itself.
+max_fraction = 0.4
+
 [encode]
 # Re-encode rather than stream-copy. See cut.py for why.
 bitrate = "128k"

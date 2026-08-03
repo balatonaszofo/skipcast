@@ -458,6 +458,64 @@ If you want this to reach your phone rather than waiting for you to open the
 panel, that needs a delivery channel — push, email, a message — and picking one
 is a decision skipcast has deliberately not made for you.
 
+## Phase 7 — removing what is not the show
+
+Everything up to here removed *people*. This removes *material*: read
+advertisements, housekeeping (merch, live dates, patron thanks), and the
+scripted intro and outro.
+
+The ranges come from the same request that writes the summary. The transcript
+is the expensive half of that call, and asking a second question about it would
+double the cost of every episode — so interstitial detection needs `[summary]
+enabled`, and with summaries off nothing is detected.
+
+Because the ranges come from the transcript and the transcript comes from the
+audio, this runs as a **second cut** after the episode is already playable. The
+cut log and the audio are regenerated, so every timestamp mapping — search
+hits, topic links — follows automatically.
+
+```toml
+[interstitial]
+enabled = true
+remove = ["ad", "housekeeping", "intro", "outro"]
+min_confidence = "likely"
+max_fraction = 0.4
+```
+
+`banter` is deliberately not in the default list. It is the judgement the model
+is worst at and the one where being wrong removes actual content: a digression
+you found boring is still the show.
+
+The prompt is written to under-mark rather than over-mark, and says why — a
+missed ad costs ninety seconds, a wrongly cut stretch destroys part of the
+episode. A host discussing a product is not an advertisement; a read spot has
+the shape of one, with a pitch, an offer and a code.
+
+On a 80-minute history episode it found eight interstitials totalling 7.8
+minutes — two sponsor reads and a live-show announcement at the top, a block of
+three mid-roll ads, and two more late on. Every one began with recognisable ad
+copy. The episode page lists what went, with a **check** button that plays each
+stretch from the retained original, because a feature that deletes part of an
+episode has to show its work.
+
+The feed description names the two separately, since they are different
+promises: `removed 27 min of Jason Calacanis and 8 min of ads and housekeeping`.
+
+### Two lanes
+
+Transcription is CPU-bound and slow; diarization runs on the GPU and is not.
+Run serially, a five-episode poll spends most of its time with the GPU idle
+waiting for Whisper.
+
+Inside `skipcast serve` these now run on separate workers: the poll finishes an
+episode at the cut, hands the transcript to a second lane, and moves straight
+on to the next episode's diarization. The database is opened in WAL mode with a
+busy timeout so two writers do not collide, and job output is routed per thread
+so two concurrent jobs do not scramble each other's logs.
+
+The CLI does the slow half inline, because there is no worker running to hand it
+to. `skipcast poll` behaves exactly as it always did.
+
 ## Running it on another machine
 
 The repo carries code and config only. Everything in `data/` — downloads, cut

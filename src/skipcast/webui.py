@@ -901,7 +901,14 @@ function renderEpisode(v) {
       <div class="sub" style="margin-top:6px">
         ${e.status === 'ready'
           ? `${mins(e.original_seconds)} → <b>${mins(e.result_seconds)}</b> ·
-             ${mins(e.cut_seconds)} of ${esc(e.cut_speakers || 'nobody')} removed`
+             ${(() => {
+               const ads = e.interstitial_seconds || 0;
+               const speech = (e.cut_seconds || 0) - ads;
+               const bits = [];
+               if (speech > 30) bits.push(`${mins(speech)} of ${esc(e.cut_speakers || 'flagged speakers')}`);
+               if (ads > 30) bits.push(`${mins(ads)} of ads`);
+               return bits.length ? bits.join(' and ') + ' removed' : 'nothing removed';
+             })()}`
           : esc(e.error || e.status)}
       </div>
     </div>
@@ -986,7 +993,8 @@ function renderEpisode(v) {
    position in the edit alongside, which is what the jump uses. */
 function topicsHtml(e) {
   const idx = e.index;
-  if (!idx || (!idx.topics.length && !idx.specifics.length)) return '';
+  if (!idx || (!idx.topics.length && !idx.specifics.length
+               && !(idx.interstitials || []).length)) return '';
   const btn = (at, label) => `<button class="btn" style="padding:5px 10px;font-size:13px"
       onclick="event.stopPropagation();playEpisode('${esc(e.key)}',${at})">
       ▶ ${label}</button>`;
@@ -1020,6 +1028,32 @@ function topicsHtml(e) {
           </div>
         </div>`).join('')}
     </div>` : '';
+  /* What was removed as advertising, listed so it can be checked. A feature
+     that deletes part of an episode has to show its work. */
+  const cuts = (idx.interstitials || []).length ? `
+    <div class="card">
+      <h2>Removed as ads and housekeeping</h2>
+      ${idx.interstitials.map(i => `
+        <div class="item">
+          <div class="row">
+            <div class="grow">
+              <div class="title wrapline" style="font-size:14.5px">${esc(i.what || i.kind)}
+                <span class="pill">${esc(i.kind)}</span>
+                ${i.confidence !== 'certain'
+                  ? `<span class="pill" style="color:var(--warn)">${esc(i.confidence)}</span>` : ''}
+              </div>
+              <div class="sub">${esc(i.from)}–${esc(i.to)} · ${Math.round(i.seconds)}s</div>
+            </div>
+            <button class="btn" style="padding:5px 10px;font-size:13px"
+              onclick="play(this,'${esc(e.key)}',${i.from_seconds},${i.from_seconds + 20})">
+              ▶ check</button>
+          </div>
+        </div>`).join('')}
+      <div class="sub" style="margin-top:9px">Tap check to hear what was cut, from
+        the retained original. Wrong? Set
+        <code>enabled = false</code> under <code>[interstitial]</code>, then re-cut.</div>
+    </div>` : '';
+
   const specifics = idx.specifics.length ? `
     <div class="card">
       <h2>Details worth keeping</h2>
@@ -1039,7 +1073,7 @@ function topicsHtml(e) {
           </div>
         </div>`).join('')}
     </div>` : '';
-  return topics + specifics;
+  return topics + specifics + cuts;
 }
 
 async function nameIt(key, cluster) {

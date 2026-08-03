@@ -117,6 +117,23 @@ class SummaryConfig:
 
 
 @dataclass
+class InterstitialConfig:
+    """Removing the parts that are not the show — ads, housekeeping, intros."""
+    enabled: bool = True
+    # Which kinds to act on. "banter" is deliberately not in the default: it is
+    # the one the model is worst at, and the one where a false positive costs
+    # actual content.
+    remove: list[str] = field(
+        default_factory=lambda: ["ad", "housekeeping", "intro", "outro"]
+    )
+    min_confidence: str = "likely"   # certain | likely | unsure
+    # Refuse the lot if they add up to more than this share of the episode.
+    # A podcast is not 40% advertising; a number that high means the model has
+    # started marking the show itself.
+    max_fraction: float = 0.4
+
+
+@dataclass
 class EncodeConfig:
     bitrate: str = "128k"
     channels: int = 1
@@ -134,6 +151,7 @@ class Config:
     poll: PollConfig = field(default_factory=PollConfig)
     transcribe: TranscribeConfig = field(default_factory=TranscribeConfig)
     summary: SummaryConfig = field(default_factory=SummaryConfig)
+    interstitial: InterstitialConfig = field(default_factory=InterstitialConfig)
     source_path: Path | None = None
 
 
@@ -185,6 +203,7 @@ def load_config(explicit: Path | None = None) -> Config:
         poll=_fill(PollConfig, raw.get("poll", {})),
         transcribe=_fill(TranscribeConfig, raw.get("transcribe", {})),
         summary=_fill(SummaryConfig, raw.get("summary", {})),
+        interstitial=_fill(InterstitialConfig, raw.get("interstitial", {})),
         source_path=path,
     )
 

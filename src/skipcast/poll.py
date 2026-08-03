@@ -45,7 +45,7 @@ def _log(msg: str) -> None:
 
 
 def process_entry(conn, cfg: Config, feed_row, entry: feeds.Entry,
-                  force: bool = False) -> Outcome:
+                  force: bool = False, defer_transcript: bool = False) -> Outcome:
     key = feeds.episode_key(feed_row["url"], entry.guid)
     existing = db.get_episode_by_guid(conn, feed_row["id"], entry.guid)
 
@@ -150,7 +150,17 @@ def process_entry(conn, cfg: Config, feed_row, entry: feeds.Entry,
         # a failure here never costs you the audio.
         if cfg.transcribe.enabled or cfg.summary.enabled:
             row = db.get_episode_by_guid(conn, feed_row["id"], entry.guid)
-            transcribe_and_summarize(conn, cfg, row)
+            if defer_transcript:
+                # Hand it to the slow lane and get on with the next episode.
+                # Transcription is CPU-bound and diarization is not, so the two
+                # overlap rather than queueing behind each other.
+                from . import jobs
+
+                jobs.enqueue(conn, "summarize", key,
+                             f"Transcribe {(entry.title or '')[:40]}")
+                _log("[poll]   queued transcription")
+            else:
+                transcribe_and_summarize(conn, cfg, row)
 
         return Outcome(key, entry.title, "ready",
                        f"{plan.cut_seconds / 60:.1f} min removed")
@@ -178,6 +188,76 @@ def index_transcript(conn, key: str, transcript: dict) -> None:
         _log(f"[poll]   {exc}")
     except Exception as exc:  # noqa: BLE001
         _log(f"[poll]   could not index transcript: {exc}")
+
+
+CONFIDENCE_ORDER = {"unsure": 0, "likely": 1, "certain": 2}
+
+
+def selected_interstitials(cfg: Config, data: dict) -> list[dict]:
+    """The detected ranges this config is willing to act on."""
+    if not cfg.interstitial.enabled:
+        return []
+    wanted = {k.strip().lower() for k in cfg.interstitial.remove}
+    floor = CONFIDENCE_ORDER.get(cfg.interstitial.min_confidence.lower(), 1)
+    return [
+        i for i in (data or {}).get("interstitials") or []
+        if i.get("kind") in wanted
+        and CONFIDENCE_ORDER.get(i.get("confidence", "unsure"), 0) >= floor
+    ]
+
+
+def apply_interstitials(conn, cfg: Config, ep, data: dict) -> float:
+    """Re-cut an episode with its ad reads and housekeeping removed.
+
+    This runs after the episode is already playable, because the ranges come
+    from the transcript and the transcript comes from the audio. So it is a
+    second pass over an existing cut rather than part of the first one — which
+    also means it is optional, restartable, and cannot cost you the episode if
+    it fails.
+    """
+    ranges = selected_interstitials(cfg, data)
+    if not ranges:
+        return 0.0
+
+    segments_path = Path(ep["segments_path"] or "")
+    source = Path(ep["source_path"] or "")
+    if not segments_path.is_file() or not source.is_file():
+        return 0.0
+
+    total = sum(r["seconds"] for r in ranges)
+    duration = float(ep["original_seconds"] or 0) or 1.0
+    if total / duration > cfg.interstitial.max_fraction:
+        _log(f"[poll]   {total / 60:.1f} min of interstitials is "
+             f"{total / duration * 100:.0f}% of the episode, over the "
+             f"{cfg.interstitial.max_fraction * 100:.0f}% ceiling — leaving them in")
+        return 0.0
+
+    doc = json.loads(segments_path.read_text())
+    identity.annotate(doc, identity.match_document(doc, conn, cfg,
+                                                   feed_id=ep["feed_id"]))
+    key = ep["key"]
+    cut_path = Path(ep["cut_path"] or (_episode_dir(cfg) / f"{key}.cut.mp3"))
+    cuts_path = Path(ep["cuts_path"] or (_episode_dir(cfg) / f"{key}.cuts.json"))
+
+    try:
+        plan = cutter.build_plan(doc, cfg, extra_cuts=ranges)
+    except cutter.CutRefused as exc:
+        _log(f"[poll]   not removing interstitials: {exc}")
+        return 0.0
+
+    kinds = ", ".join(sorted({r["kind"] for r in ranges}))
+    _log(f"[poll]   re-cutting to drop {total / 60:.1f} min of {kinds}")
+    cutter.write_log(plan, doc, cfg, cuts_path)
+    cutter.render(source, plan, cfg, cut_path)
+
+    db.upsert_episode(conn, ep["feed_id"], key, ep["guid"], {
+        "cut_path": str(cut_path),
+        "cuts_path": str(cuts_path),
+        "result_seconds": audio.duration_seconds(cut_path),
+        "cut_seconds": plan.cut_seconds,
+        "interstitial_seconds": plan.interstitial_seconds,
+    })
+    return plan.interstitial_seconds
 
 
 def index_entities(conn, episode_id: int, data: dict) -> None:
@@ -319,6 +399,12 @@ def transcribe_and_summarize(conn, cfg: Config, ep, force: bool = False,
         })
         if result.data:
             index_entities(conn, ep["id"], result.data)
+            try:
+                # Refetch: the summary write above changed the row this needs.
+                fresh = db.get_episode_by_key(conn, key)
+                apply_interstitials(conn, cfg, fresh, result.data)
+            except Exception as exc:  # noqa: BLE001 — the cut we have is fine
+                _log(f"[poll]   could not remove interstitials: {exc}")
     except Exception as exc:  # noqa: BLE001
         _log(f"[poll]   summary failed: {exc}")
 
@@ -387,7 +473,7 @@ def recut_episode(conn, cfg: Config, ep) -> Outcome:
 
 
 def poll_feed(conn, cfg: Config, feed_row, limit: int | None = None,
-              force: bool = False) -> Report:
+              force: bool = False, defer_transcript: bool = False) -> Report:
     report = Report()
     _log(f"[poll] {feed_row['slug']}: reading {feed_row['url']}")
     try:
@@ -405,7 +491,8 @@ def poll_feed(conn, cfg: Config, feed_row, limit: int | None = None,
     _log(f"[poll] {len(entries)} episodes in feed, considering newest {len(considered)}")
 
     for entry in considered:
-        outcome = process_entry(conn, cfg, feed_row, entry, force=force)
+        outcome = process_entry(conn, cfg, feed_row, entry, force=force,
+                                defer_transcript=defer_transcript)
         report.outcomes.append(outcome)
         if report.count("failed") >= cfg.poll.max_failures:
             _log(f"[poll] stopping after {report.count('failed')} failures")

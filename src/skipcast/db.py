@@ -76,6 +76,7 @@ CREATE TABLE IF NOT EXISTS episodes (
     original_seconds REAL,
     result_seconds   REAL,
     cut_seconds      REAL,
+    interstitial_seconds REAL,      -- of cut_seconds, how much was ads etc
     cut_speakers     TEXT,          -- comma separated names actually removed
     transcript_path  TEXT,
     summary_path     TEXT,
@@ -204,7 +205,7 @@ def db_path(cfg: Config) -> Path:
 # them without this. Adding a nullable column is the only migration shape this
 # project needs; anything structural rebuilds from the files on disk instead.
 ADDED_COLUMNS = {
-    "episodes": [("summary_json_path", "TEXT")],
+    "episodes": [("summary_json_path", "TEXT"), ("interstitial_seconds", "REAL")],
 }
 
 
@@ -214,9 +215,17 @@ def migrate(conn: sqlite3.Connection) -> list[str]:
     for table, columns in ADDED_COLUMNS.items():
         have = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
         for name, decl in columns:
-            if name not in have:
+            if name in have:
+                continue
+            try:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
-                applied.append(f"{table}.{name}")
+            except sqlite3.OperationalError as exc:
+                # Two workers can open the database at the same moment and both
+                # find the column missing. Losing that race is success.
+                if "duplicate column" not in str(exc).lower():
+                    raise
+                continue
+            applied.append(f"{table}.{name}")
     if applied:
         conn.commit()
     return applied
@@ -234,6 +243,14 @@ def connect(cfg: Config, check_same_thread: bool = True) -> sqlite3.Connection:
     conn = sqlite3.connect(path, check_same_thread=check_same_thread)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    # Transcription and diarization run on separate workers so they can
+    # overlap, which means two writers. The default rollback journal makes them
+    # take turns for the whole of every write transaction and fail immediately
+    # on contention; WAL lets a reader carry on during a write, and the timeout
+    # turns the remaining collisions into a short wait instead of an error.
+    # WAL is a property of the database file, so this only does anything once.
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA busy_timeout = 15000")
     conn.executescript(SCHEMA)
     migrate(conn)
     return conn
@@ -435,7 +452,8 @@ def upsert_episode(conn: sqlite3.Connection, feed_id: int, key: str, guid: str,
     cols = ["title", "description", "link", "published", "published_ts",
             "enclosure_url", "enclosure_type", "source_path", "segments_path",
             "cut_path", "cuts_path", "original_seconds", "result_seconds",
-            "cut_seconds", "cut_speakers", "transcript_path", "summary_path",
+            "cut_seconds", "interstitial_seconds", "cut_speakers",
+            "transcript_path", "summary_path",
             "summary_json_path", "summary_model", "status", "error"]
     present = {k: fields[k] for k in cols if k in fields}
     row = get_episode_by_guid(conn, feed_id, guid)

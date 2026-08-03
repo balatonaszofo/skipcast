@@ -12,12 +12,12 @@ constraints.
 
 from __future__ import annotations
 
-import contextlib
 import datetime as dt
 import io
 import json
 import queue
 import sqlite3
+import sys
 import threading
 import traceback
 from dataclasses import dataclass
@@ -142,30 +142,91 @@ class _LogSink(io.TextIOBase):
         return "\n".join(self.lines)
 
 
+class _Router:
+    """A stdout/stderr stand-in that sends each thread's writes to its own sink.
+
+    Jobs capture their output by rebinding the process streams, which is fine
+    with one worker and wrong with two: contextlib.redirect_stdout is global,
+    so the moment two jobs run at once each one's log swallows the other's
+    lines — and anything the main thread prints disappears into whichever job
+    happens to be running.
+
+    Routing per thread keeps the capture but scopes it to the job that asked
+    for it. Threads with no sink registered write through to the real stream.
+    """
+
+    def __init__(self, real):
+        self._real = real
+        self._local = threading.local()
+
+    def bind(self, sink) -> None:
+        self._local.sink = sink
+
+    def release(self) -> None:
+        self._local.sink = None
+
+    @property
+    def _target(self):
+        return getattr(self._local, "sink", None) or self._real
+
+    def write(self, text: str) -> int:
+        return self._target.write(text)
+
+    def flush(self) -> None:
+        self._target.flush()
+
+    def isatty(self) -> bool:
+        return False
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+def _install_routers() -> tuple[_Router, _Router]:
+    """Swap the process streams for routers, once."""
+    if not isinstance(sys.stdout, _Router):
+        sys.stdout = _Router(sys.stdout)
+    if not isinstance(sys.stderr, _Router):
+        sys.stderr = _Router(sys.stderr)
+    return sys.stdout, sys.stderr
+
+
+# Transcription is CPU-bound and slow; diarization is GPU-bound and not. Run
+# them on separate workers and a five-episode poll overlaps the two instead of
+# waiting for each transcript before fetching the next episode. The split is by
+# job kind, so nothing else has to know about it.
+SLOW_KINDS = ("summarize",)
+
+
 @dataclass
 class Worker:
     cfg: Config
+    # "main" takes everything except SLOW_KINDS; "slow" takes only those.
+    lane: str = "main"
     _thread: threading.Thread | None = None
     _wake: queue.Queue | None = None
     _stop: threading.Event | None = None
     _last_write: float = 0.0
+    _twin: "Worker | None" = None
 
-    def start(self) -> None:
+    def start(self, reset_running: bool = True) -> None:
         from . import db
 
         conn = db.connect(self.cfg, check_same_thread=False)
         ensure_schema(conn)
-        # Anything left running from a previous process died with it.
-        conn.execute(
-            "UPDATE jobs SET status='failed', error='interrupted by restart', "
-            "finished_at=? WHERE status='running'", (_now(),),
-        )
-        conn.commit()
+        if reset_running:
+            # Anything left running from a previous process died with it.
+            conn.execute(
+                "UPDATE jobs SET status='failed', error='interrupted by restart', "
+                "finished_at=? WHERE status='running'", (_now(),),
+            )
+            conn.commit()
         conn.close()
 
         self._wake = queue.Queue()
         self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._run, name="skipcast-worker",
+        self._thread = threading.Thread(target=self._run,
+                                        name=f"skipcast-worker-{self.lane}",
                                         daemon=True)
         self._thread.start()
 
@@ -176,9 +237,12 @@ class Worker:
             self._wake.put(None)
 
     def poke(self) -> None:
-        """Tell the worker a job was just queued."""
+        """Tell the worker a job was just queued, and its twin lane too."""
         if self._wake:
             self._wake.put(None)
+        twin = getattr(self, "_twin", None)
+        if twin is not None and twin._wake:
+            twin._wake.put(None)
 
     # -- internals ---------------------------------------------------------
     def _touch(self, job_id: int, log: str, progress: str) -> None:
@@ -206,8 +270,12 @@ class Worker:
         while not self._stop.is_set():
             conn = db.connect(self.cfg, check_same_thread=False)
             ensure_schema(conn)
+            placeholders = ",".join("?" * len(SLOW_KINDS))
+            test = "IN" if self.lane == "slow" else "NOT IN"
             row = conn.execute(
-                "SELECT * FROM jobs WHERE status='queued' ORDER BY id LIMIT 1"
+                f"SELECT * FROM jobs WHERE status='queued' "
+                f"AND kind {test} ({placeholders}) ORDER BY id LIMIT 1",
+                SLOW_KINDS,
             ).fetchone()
             if row is None:
                 conn.close()
@@ -218,20 +286,31 @@ class Worker:
                 continue
 
             job_id = row["id"]
-            conn.execute("UPDATE jobs SET status='running', started_at=? WHERE id=?",
-                         (_now(), job_id))
+            # Claim it, guarding against the other lane having taken it first.
+            claimed = conn.execute(
+                "UPDATE jobs SET status='running', started_at=? "
+                "WHERE id=? AND status='queued'",
+                (_now(), job_id),
+            ).rowcount
             conn.commit()
             conn.close()
+            if not claimed:
+                continue
 
             sink = _LogSink(self, job_id)
             status, error = "done", None
+            out, err = _install_routers()
+            out.bind(sink)
+            err.bind(sink)
             try:
-                with contextlib.redirect_stderr(sink), contextlib.redirect_stdout(sink):
-                    self._dispatch(row, sink)
+                self._dispatch(row, sink)
             except Exception as exc:  # noqa: BLE001 — a bad job must not kill the worker
                 status = "failed"
                 error = f"{type(exc).__name__}: {exc}"
                 sink.lines.extend(traceback.format_exc().strip().splitlines()[-6:])
+            finally:
+                out.release()
+                err.release()
 
             conn = db.connect(self.cfg, check_same_thread=False)
             conn.execute(
@@ -252,9 +331,14 @@ class Worker:
                 feed = db.get_feed(conn, row["target"])
                 if feed is None:
                     raise ValueError(f"no feed named {row['target']}")
+                # Inside the server there is a second lane to hand the
+                # transcript to; the CLI has no worker running, so it does the
+                # slow half itself rather than queueing work nothing will pick
+                # up.
                 poller.poll_feed(conn, self.cfg, feed,
                                  limit=params.get("limit"),
-                                 force=params.get("force", False))
+                                 force=params.get("force", False),
+                                 defer_transcript=True)
 
             elif row["kind"] == "reprocess":
                 ep = db.get_episode_by_key(conn, row["target"])
@@ -263,7 +347,8 @@ class Worker:
                 feed = conn.execute("SELECT * FROM feeds WHERE id=?",
                                     (ep["feed_id"],)).fetchone()
                 entry = poller.entry_from_row(ep)
-                poller.process_entry(conn, self.cfg, feed, entry, force=True)
+                poller.process_entry(conn, self.cfg, feed, entry, force=True,
+                                     defer_transcript=True)
 
             elif row["kind"] == "summarize":
                 ep = db.get_episode_by_key(conn, row["target"])
@@ -365,14 +450,25 @@ class Scheduler:
 
 
 _worker: Worker | None = None
+_slow_worker: Worker | None = None
 _scheduler: Scheduler | None = None
 
 
 def worker_for(cfg: Config) -> Worker:
-    global _worker, _scheduler
+    """The main worker, starting the slow lane and the scheduler alongside it.
+
+    Callers only ever talk to the main one — poke() on it wakes both, since a
+    job enqueued for either lane should not wait out the other's poll interval.
+    """
+    global _worker, _slow_worker, _scheduler
     if _worker is None:
-        _worker = Worker(cfg)
+        _worker = Worker(cfg, lane="main")
         _worker.start()
+        _slow_worker = Worker(cfg, lane="slow")
+        # Only one of them may clear running jobs, or the second wipes the
+        # first's freshly claimed row.
+        _slow_worker.start(reset_running=False)
+        _worker._twin = _slow_worker
         _scheduler = Scheduler(cfg, _worker)
         _scheduler.start()
     return _worker

@@ -76,6 +76,10 @@ class Plan:
     # their own settings.
     mode: str = "cut"
     kept_labels: list[str] = field(default_factory=list)
+    # How much of cut_seconds came from ad reads and housekeeping rather than
+    # from a speaker. Reported separately because they are different promises:
+    # one is "you asked for this voice gone", the other "this was not the show".
+    interstitial_seconds: float = 0.0
 
     @property
     def fraction(self) -> float:
@@ -94,6 +98,31 @@ def merge_same_speaker(segments: list[dict], label: str, gap: float) -> list[Reg
             out[-1].end = max(out[-1].end, s["end"])
         else:
             out.append(Region(s["start"], s["end"], label))
+    return out
+
+
+def subtract(regions: list[Region], minus: list[Region]) -> list[Region]:
+    """The parts of `regions` not already covered by `minus`.
+
+    Used to attribute the cut honestly: an ad read that falls inside a stretch
+    of a speaker who was being removed anyway did not shorten the episode by
+    its own length, and reporting it as if it did makes the two numbers in the
+    feed note add up to more than what went.
+    """
+    out: list[Region] = []
+    blockers = union(minus)
+    for r in union(regions):
+        cursor = r.start
+        for b in blockers:
+            if b.end <= cursor or b.start >= r.end:
+                continue
+            if b.start > cursor:
+                out.append(Region(cursor, min(b.start, r.end), r.speaker_label))
+            cursor = max(cursor, b.end)
+            if cursor >= r.end:
+                break
+        if cursor < r.end:
+            out.append(Region(cursor, r.end, r.speaker_label))
     return out
 
 
@@ -217,12 +246,49 @@ def _keep_only_candidates(doc: dict, cfg: Config, labels: list[str],
     return candidates
 
 
+def _extra_regions(extra_cuts, duration: float, plan: Plan) -> list[Region]:
+    """Ranges to remove that have nothing to do with who is speaking.
+
+    Ad reads and housekeeping, found in the transcript rather than in the
+    diarization. They arrive already filtered for length and confidence, so
+    they go straight in as candidates — but they are recorded as decisions like
+    everything else, because "why is this gone" has to be answerable from the
+    cut log alone.
+    """
+    out = []
+    for item in extra_cuts or []:
+        start = float(item.get("from_seconds", 0.0))
+        end = min(float(item.get("to_seconds", 0.0)), duration)
+        if end <= start:
+            continue
+        kind = str(item.get("kind") or "interstitial")
+        out.append(Region(start, end, kind))
+        plan.decisions.append(Decision(
+            speaker_label=kind,
+            matched_name=None,
+            similarity=0.0,
+            start=round(start, 3),
+            end=round(end, 3),
+            duration=round(end - start, 3),
+            decision="cut",
+            reason=(item.get("what") or kind)
+                   + f" ({item.get('confidence', 'unsure')})",
+        ))
+    return out
+
+
 def build_plan(doc: dict, cfg: Config, overrides: list[str] | None = None,
-               keep_only: list[str] | None = None) -> Plan:
+               keep_only: list[str] | None = None,
+               extra_cuts: list[dict] | None = None) -> Plan:
     """Decide what to remove.
 
     `keep_only` inverts the question: instead of naming who to cut, name who to
     keep and everyone else goes. That is what a person feed is built from.
+
+    `extra_cuts` are ranges to remove regardless of who is talking — the ad
+    reads and housekeeping the transcript turned up. They pass through the same
+    padding, union and ceiling rules as everything else, so one set of
+    guarantees covers both kinds of removal.
     """
     c = cfg.cut
     duration = float(doc["duration"])
@@ -231,6 +297,12 @@ def build_plan(doc: dict, cfg: Config, overrides: list[str] | None = None,
               else resolve_skip_labels(doc, overrides))
 
     plan = Plan(duration=duration, mode=mode)
+    if mode == "cut" and not labels and extra_cuts:
+        # Nothing to cut speaker-wise, but there are ads to remove. Without
+        # this the early return below would ship the episode unedited.
+        plan.skipped_labels = []
+        return _finish_plan(plan, [], _extra_regions(extra_cuts, duration, plan),
+                            cfg, duration)
     if mode == "keep_only":
         if not labels:
             # Nothing to keep is not "keep everything" — it means the voice we
@@ -248,6 +320,25 @@ def build_plan(doc: dict, cfg: Config, overrides: list[str] | None = None,
             plan.result_seconds = duration
             return plan
         candidates = _skip_candidates(doc, cfg, labels, plan)
+
+    return _finish_plan(plan, candidates,
+                        _extra_regions(extra_cuts, duration, plan),
+                        cfg, duration)
+
+
+def _finish_plan(plan: Plan, candidates: list[Region], extras: list[Region],
+                 cfg: Config, duration: float) -> Plan:
+    """Pad, union and check the candidates, whatever produced them."""
+    c = cfg.cut
+
+    # What the interstitials removed that the speaker rules would not have
+    # anyway. An ad inside a stretch of a speaker already being cut shortens
+    # the episode by nothing extra, and counting it twice would make the feed
+    # note claim more was removed than went.
+    plan.interstitial_seconds = sum(
+        r.duration for r in subtract(extras, candidates)
+    )
+    candidates = candidates + extras
 
     # Pull boundaries inward so we do not clip the kept speaker either side.
     # At the very start and end of the episode there is no adjacent kept
@@ -442,6 +533,7 @@ def write_log(plan: Plan, doc: dict, cfg: Config, dest: Path) -> Path:
             "joins": max(0, len(plan.keeps) - 1),
             "absorbed_padding_slivers": plan.absorbed_slivers,
             "dropped_short_keeps": plan.dropped_keeps,
+            "interstitial_seconds": round(plan.interstitial_seconds, 3),
         },
         "cuts": [asdict(r) for r in plan.cuts],
         # Recorded rather than left to be derived: timeline.py maps original

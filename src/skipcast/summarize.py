@@ -139,6 +139,12 @@ figure | claim | study | product | person | place | recommendation | other",
      "speaker": "who said it, or the cluster label if unnamed",
      "at": "12:34",
      "confidence": "firm | hedged | uncertain"}
+  ],
+  "interstitials": [
+    {"kind": "ad | housekeeping | intro | outro | banter",
+     "from": "12:34", "to": "14:02",
+     "what": "what this stretch is, in a few words",
+     "confidence": "certain | likely | unsure"}
   ]
 }
 ```
@@ -153,7 +159,28 @@ an episode with none gets an empty list.
 - `confidence` is about how the speaker said it: `firm` for a stated position, \
 `hedged` for thinking out loud, `uncertain` where the transcript itself looks \
 garbled.
-- Attribute to a real transcript speaker, or omit `speaker`. Never invent a name."""
+- Attribute to a real transcript speaker, or omit `speaker`. Never invent a name.
+
+`interstitials` are stretches that are not the show: read advertisements and \
+sponsor spots, housekeeping (merch, live dates, "like and subscribe", patron \
+thanks), the scripted intro before the episode starts and the outro after it \
+ends. These get removed from the listener's copy, so the standard is high:
+
+- Mark a stretch only if you can point at where it starts and where it ends. \
+`from` and `to` are transcript timestamps copied verbatim; an entry missing \
+either is useless and should be left out.
+- A host discussing a product, a company or their own work is not an \
+advertisement. A read spot has the shape of one: a pitch, a benefit, an offer, \
+a code or a URL. When it is argument rather than copy, leave it.
+- `banter` means a stretch with no informational content at all, not a \
+digression you found less interesting. Most episodes have none. Use it \
+sparingly or not at all.
+- `confidence` is `certain` for an unmistakable read spot, `likely` where the \
+shape is right but the boundary is fuzzy, `unsure` for anything else. Prefer \
+`unsure` to guessing.
+- Under-marking is the safe error. A missed ad costs a listener ninety \
+seconds; a wrongly cut stretch destroys part of the episode they wanted. If in \
+doubt, leave it out — an episode with no interstitials gets an empty list."""
 
 
 class SummaryError(RuntimeError):
@@ -282,6 +309,7 @@ def normalize_index(data: dict) -> dict:
         "kind_label": str(data.get("kind_label") or "")[:80],
         "topics": [],
         "specifics": [],
+        "interstitials": [],
     }
     for t in data.get("topics") or []:
         if not isinstance(t, dict) or not (t.get("title") or "").strip():
@@ -308,6 +336,50 @@ def normalize_index(data: dict) -> dict:
             "confidence": confidence if confidence in ("firm", "hedged", "uncertain")
                           else "",
         })
+    out["interstitials"] = normalize_interstitials(data.get("interstitials"))
+    return out
+
+
+# An interstitial shorter than this is either a mis-parse or not worth a join;
+# one longer than this is almost certainly the model swallowing real content.
+MIN_INTERSTITIAL = 8.0
+MAX_INTERSTITIAL = 600.0
+
+
+def normalize_interstitials(raw) -> list[dict]:
+    """Ad reads and housekeeping, as ranges we would be willing to cut.
+
+    Stricter than the other two lists, because these do not annotate the
+    episode — they remove part of it. Anything without both ends, or with ends
+    that do not make sense, is dropped rather than repaired: a guessed boundary
+    here takes real audio with it.
+    """
+    kinds = {"ad", "housekeeping", "intro", "outro", "banter"}
+    out = []
+    for item in raw or []:
+        if not isinstance(item, dict):
+            continue
+        start = timestamp_seconds(item.get("from"))
+        end = timestamp_seconds(item.get("to"))
+        if start is None or end is None:
+            continue
+        span = end - start
+        if span < MIN_INTERSTITIAL or span > MAX_INTERSTITIAL:
+            continue
+        kind = str(item.get("kind") or "").strip().lower()
+        confidence = str(item.get("confidence") or "").strip().lower()
+        out.append({
+            "kind": kind if kind in kinds else "other",
+            "from": str(item.get("from") or "").strip()[:12],
+            "to": str(item.get("to") or "").strip()[:12],
+            "from_seconds": start,
+            "to_seconds": end,
+            "seconds": round(span, 2),
+            "what": str(item.get("what") or "").strip()[:200],
+            "confidence": (confidence if confidence in ("certain", "likely", "unsure")
+                           else "unsure"),
+        })
+    out.sort(key=lambda i: i["from_seconds"])
     return out
 
 
@@ -478,9 +550,14 @@ def summarize(transcript_text: str, title: str, cfg: Config,
     )
     if structured:
         if result.data:
+            found = result.data["interstitials"]
+            extra = ""
+            if found:
+                total = sum(i["seconds"] for i in found) / 60
+                extra = f", {len(found)} interstitial(s) totalling {total:.1f} min"
             print(
                 f"[summary] indexed {len(result.data['topics'])} topics, "
-                f"{len(result.data['specifics'])} specifics "
+                f"{len(result.data['specifics'])} specifics{extra} "
                 f"({result.data.get('kind_label') or result.data['kind']})",
                 file=sys.stderr,
             )
