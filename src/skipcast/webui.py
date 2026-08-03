@@ -58,9 +58,10 @@ PAGE = r"""<!doctype html>
   button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
   button.danger { color:var(--bad); }
   button.btn:disabled { opacity:.45; }
-  input[type=text], input[type=search] { width:100%; background:var(--panel2);
+  input[type=text], input[type=search], select { width:100%; background:var(--panel2);
     color:var(--fg); border:1px solid var(--line); border-radius:9px; padding:11px;
     font:inherit; font-size:16px; }
+  select { appearance:none; -webkit-appearance:none; }
   .pill { font-size:11px; padding:2px 8px; border-radius:99px; background:var(--panel2);
     color:var(--muted); border:1px solid var(--line); white-space:nowrap; }
   .pill.ready { color:var(--ok); } .pill.failed, .pill.refused { color:var(--bad); }
@@ -133,6 +134,7 @@ PAGE = r"""<!doctype html>
   <h1>skipcast <span id="hdr"></span></h1>
   <nav>
     <button data-tab="listen" class="on">Listen</button>
+    <button data-tab="search">Search</button>
     <button data-tab="feeds">Podcasts</button>
     <button data-tab="add">Add</button>
     <button data-tab="speakers">Speakers</button>
@@ -219,17 +221,25 @@ function play(btn, key, start, end) {
 let NOW = null, RATE = 1, scrubbing = false, lastSave = 0;
 const RATES = [1, 1.25, 1.5, 1.75, 2];
 
-function playEpisode(key) {
+/* `at` jumps to a position instead of resuming — a search hit or a topic
+   heading. It is already in the edited file's clock; the server does that
+   conversion, because only it knows what was cut. */
+function playEpisode(key, at) {
   const ep = (LISTEN || []).find(e => e.key === key);
-  if (!ep) return;
-  if (NOW && NOW.key === key) { togglePlay(); return; }
+  if (!ep) return toast('That episode is not ready to play');
+  if (NOW && NOW.key === key && at == null) { togglePlay(); return; }
   savePosition(true);
+  if (NOW && NOW.key === key && at != null) {
+    audio.currentTime = at; updateMini();
+    if (audio.paused) audio.play().catch(()=>{});
+    return;
+  }
   NOW = ep;
   stopAt = null;
   if (playingBtn) { playingBtn.classList.remove('primary'); playingBtn = null; }
   audio.src = `/audio/${key}.mp3`;
   audio.playbackRate = RATE;
-  const start = (ep.finished ? 0 : (ep.position || 0));
+  const start = at != null ? at : (ep.finished ? 0 : (ep.position || 0));
   const go = () => {
     if (start > 0 && start < (audio.duration || Infinity) - 5) audio.currentTime = start;
     audio.play().catch(e => toast('Playback blocked — tap play again'));
@@ -380,6 +390,7 @@ function render() {
   if (VIEW && VIEW.kind === 'episode') return renderEpisode(VIEW);
   if (VIEW && VIEW.kind === 'job') return renderJob(VIEW);
   if (TAB === 'listen') return renderListen();
+  if (TAB === 'search') return renderSearch();
   if (TAB === 'feeds') return renderFeeds();
   if (TAB === 'add') return renderAdd();
   if (TAB === 'speakers') return renderSpeakers();
@@ -433,6 +444,101 @@ function renderListen() {
         ${pct > 1 && !e.finished ? `<div class="prog"><i style="width:${pct}%"></i></div>` : ''}
       </div>`;
   }).join('') + '</div>';
+}
+
+/* ---- search ------------------------------------------------------------ */
+let SEARCH = {q: '', results: null, busy: false, error: '', count: 0};
+
+function renderSearch() {
+  const idx = (STATE && STATE.search) || {passages: 0, episodes: 0};
+  const feeds = (STATE.feeds || []).map(
+    f => `<option value="${esc(f.slug)}">${esc(f.title || f.slug)}</option>`).join('');
+  el.innerHTML = `
+    <div class="card">
+      <div class="stack">
+        <input type="search" id="sq" placeholder="Anything anyone said…"
+               value="${esc(SEARCH.q)}" autocapitalize="none" autocorrect="off"
+               enterkeyhint="search">
+        <div class="row">
+          <select id="sfeed" class="grow">
+            <option value="">All podcasts</option>${feeds}
+          </select>
+          <button class="btn primary" onclick="doTranscriptSearch()">Search</button>
+        </div>
+      </div>
+      <div class="sub" style="margin-top:9px">
+        ${idx.episodes
+          ? `${idx.passages.toLocaleString()} passages from ${idx.episodes}
+             episode${idx.episodes === 1 ? '' : 's'} indexed.
+             Quote a phrase, or end a word with * for a prefix.`
+          : 'Nothing is indexed yet — episodes become searchable once transcribed.'}
+        <a class="back" style="margin:0 0 0 6px" onclick="rebuildIndex()">Rebuild</a>
+      </div>
+    </div>
+    <div id="sresults">${searchResultsHtml()}</div>`;
+  const box = document.getElementById('sq');
+  if (box) box.addEventListener('keydown', e => {
+    if (e.key === 'Enter') doTranscriptSearch();
+  });
+  const sel = document.getElementById('sfeed');
+  if (sel && SEARCH.feed) sel.value = SEARCH.feed;
+}
+
+function searchResultsHtml() {
+  if (SEARCH.busy) return '<div class="empty"><span class="spin"></span> Searching…</div>';
+  if (SEARCH.error) return `<div class="empty">${esc(SEARCH.error)}</div>`;
+  if (SEARCH.results === null) return '';
+  if (!SEARCH.results.length) {
+    return `<div class="empty">Nothing matched “${esc(SEARCH.q)}”.</div>`;
+  }
+  return `<div class="card"><h2>${SEARCH.count} passage${SEARCH.count === 1 ? '' : 's'}</h2>` +
+    SEARCH.results.map(r => `
+      <div class="item">
+        <div class="sub"><b>${esc(r.speaker)}</b> · ${esc(r.episode_title)}</div>
+        <div class="wrapline" style="margin:7px 0; font-size:14.5px">${r.snippet_html}</div>
+        <div class="wrap">
+          ${r.removed
+            /* The moment is in the original but not in the edit — offer the
+               source audio rather than a link that silently lands elsewhere. */
+            ? `<button class="btn" onclick="play(this,'${esc(r.episode_key)}',${r.start},${r.start + 25})">
+                 ▶ ${clock(r.start)} in the original</button>
+               <span class="pill">cut from your copy</span>`
+            : `<button class="btn primary"
+                 onclick="playEpisode('${esc(r.episode_key)}',${r.at_cut})">
+                 ▶ ${clock(r.at_cut)}</button>`}
+          <button class="btn" onclick="openEpisode('${esc(r.episode_key)}')">Episode</button>
+        </div>
+      </div>`).join('') + '</div>';
+}
+
+async function doTranscriptSearch() {
+  const field = document.getElementById('sq');
+  const sel = document.getElementById('sfeed');
+  const q = (field ? field.value : '').trim();
+  SEARCH.feed = sel ? sel.value : '';
+  if (!q) { toast('Type something to search for'); if (field) field.focus(); return; }
+  SEARCH.q = q; SEARCH.busy = true; SEARCH.error = ''; SEARCH.results = null;
+  document.getElementById('sresults').innerHTML = searchResultsHtml();
+  try {
+    let url = '/api/transcripts/search?q=' + encodeURIComponent(q);
+    if (SEARCH.feed) url += '&feed=' + encodeURIComponent(SEARCH.feed);
+    const d = await api(url);
+    SEARCH.results = d.results; SEARCH.count = d.count;
+  } catch (e) {
+    SEARCH.error = e.message;
+  }
+  SEARCH.busy = false;
+  const box = document.getElementById('sresults');
+  if (box) box.innerHTML = searchResultsHtml();
+}
+
+async function rebuildIndex() {
+  try {
+    const r = await api('/api/reindex', {method:'POST'});
+    toast('Rebuilding — watch it in Activity');
+    await refresh(true);
+    openJob(r.job_id);
+  } catch (e) { toast(e.message); }
 }
 
 function renderFeeds() {
@@ -566,6 +672,7 @@ function renderFeed(v) {
       <div class="sub" style="margin-top:9px">Each episode takes roughly 15 minutes
         to download, diarize and cut.</div>
     </div>
+    ${feedRulesHtml(f)}
     <div class="card">
       <h2>Episodes</h2>
       ${eps.length ? eps.map(e => `
@@ -580,6 +687,55 @@ function renderFeed(v) {
         </div>`).join('')
       : '<div class="empty">Nothing fetched yet. Tap “Newest 1”.</div>'}
     </div>`;
+}
+
+/* Three states, not a toggle: a speaker either follows their global flag or
+   this show overrides it in one direction. "Keep" is the one that needs the
+   distinction — it means keep them here even though they are cut elsewhere. */
+function feedRulesHtml(f) {
+  if (!STATE.speakers.length) return '';
+  const rules = STATE.feed_rules || [];
+  return `
+    <div class="card">
+      <h2>Who gets cut from this podcast</h2>
+      <div class="sub" style="margin-bottom:11px">Default follows the switch on
+        the Speakers tab. Set it here to make this show an exception.
+        Episodes already fetched need a re-cut.</div>
+      ${STATE.speakers.map(s => {
+        const rule = rules.find(r => r.slug === f.slug && r.speaker === s.name);
+        const mode = rule ? (rule.skip ? 'cut' : 'keep') : 'default';
+        const on = m => m === mode ? 'primary' : '';
+        const n = JSON.stringify(s.name), slug = JSON.stringify(f.slug);
+        return `
+          <div class="item">
+            <div class="row">
+              <div class="grow">
+                <div class="title">${esc(s.name)}</div>
+                <div class="sub">${mode === 'default'
+                  ? (s.skip ? 'cut from every podcast' : 'kept everywhere')
+                  : (mode === 'cut' ? 'cut from this show'
+                     : 'kept here' + (s.skip ? ', despite being cut elsewhere' : ''))}</div>
+              </div>
+            </div>
+            <div class="wrap" style="margin-top:8px">
+              <button class="btn ${on('default')}" onclick='setRule(${slug},${n},null)'>Default</button>
+              <button class="btn ${on('cut')}" onclick='setRule(${slug},${n},true)'>Cut</button>
+              <button class="btn ${on('keep')}" onclick='setRule(${slug},${n},false)'>Keep</button>
+            </div>
+          </div>`;
+      }).join('')}
+    </div>`;
+}
+
+async function setRule(slug, name, skip) {
+  try {
+    await api(`/api/feeds/${slug}/rules`, {method:'POST', body:{name, skip}});
+    toast(skip === null ? `${name} follows the global setting here`
+          : skip ? `${name} will be cut from this show`
+                 : `${name} will be kept on this show`);
+    await refresh(true);
+    openFeed(slug);
+  } catch (e) { toast(e.message); }
 }
 
 async function pollFeed(slug, limit) {
@@ -622,20 +778,35 @@ function renderEpisode(v) {
       </div>
     </div>
     ${e.summary ? `<div class="card">
-      <h2>Summary</h2>
+      <h2>Summary${e.index && e.index.kind_label
+        ? ` <span class="muted" style="text-transform:none;letter-spacing:0">·
+            ${esc(e.index.kind_label)}</span>` : ''}</h2>
       <div class="md">${md(e.summary)}</div>
-      ${e.has_transcript ? `<div style="margin-top:11px">
-        <a class="btn" href="/api/episodes/${esc(e.key)}/transcript" target="_blank">Read transcript</a>
-      </div>` : ''}
+      <div class="wrap" style="margin-top:11px">
+        ${e.has_transcript ? `<a class="btn"
+          href="/api/episodes/${esc(e.key)}/transcript" target="_blank">Read transcript</a>` : ''}
+        ${STATE.summary_ready ? `<button class="btn"
+          onclick="epJob('${esc(e.key)}','summarize')">Summarise again</button>` : ''}
+      </div>
+      ${e.index ? '' : `<div class="sub" style="margin-top:9px">This summary
+        predates topic links. Summarising again adds them — it reuses the
+        transcript, so it takes about a minute.</div>`}
     </div>` : `<div class="card">
       <h2>Summary</h2>
       <div class="sub">Not summarised yet.
         ${e.has_transcript ? 'Transcript is ready.' : ''}</div>
       <button class="btn primary" style="margin-top:11px"
-        onclick="epJob('${esc(e.key)}','summarize')">Summarise this episode</button>
-      <div class="sub" style="margin-top:9px">Transcribes locally, then writes the
-        summary with Claude. Takes several minutes and needs ANTHROPIC_API_KEY set.</div>
+        onclick="epJob('${esc(e.key)}','summarize')"
+        ${STATE.summary_ready ? '' : 'disabled'}>Summarise this episode</button>
+      <div class="sub" style="margin-top:9px">${
+        !STATE.summary_enabled
+          ? 'Summaries are switched off in config.toml.'
+          : STATE.summary_ready
+            ? `Transcribes locally, then summarises with ${esc(STATE.summary_provider)}. Takes about 20 minutes.`
+            : `No API key for ${esc(STATE.summary_provider)}. Add it to the .env file beside config.toml, then restart the service — it only reads the file at startup.`
+      }</div>
     </div>`}
+    ${topicsHtml(e)}
     <div class="card">
       <h2>Who is in this episode</h2>
       <div class="sub" style="margin-bottom:11px">Tap ▶ to hear a voice, then name it.
@@ -680,6 +851,67 @@ function renderEpisode(v) {
         using the existing analysis — about a minute. Reprocess downloads and
         re-analyses from scratch.</div>
     </div>`;
+}
+
+/* Topics and specifics come from the structured half of the summary. Their
+   timestamps are the original episode's; the server sends the matching
+   position in the edit alongside, which is what the jump uses. */
+function topicsHtml(e) {
+  const idx = e.index;
+  if (!idx || (!idx.topics.length && !idx.specifics.length)) return '';
+  const btn = (at, label) => `<button class="btn" style="padding:5px 10px;font-size:13px"
+      onclick="event.stopPropagation();playEpisode('${esc(e.key)}',${at})">
+      ▶ ${label}</button>`;
+
+  /* A topic and a quote want opposite things when the timestamp was cut.
+     Topics open where the host introduces them, and the host is often exactly
+     who was removed — so jump to the next surviving moment, which is where
+     that topic actually starts for this listener. A specific is a particular
+     thing someone said: if it is gone, saying so beats seeking near it, and
+     the retained original can still play it. */
+  const jumpTopic = t => t.at_cut == null ? ''
+    : btn(t.at_cut, clock(t.at_cut));
+  const jumpSpecific = s => {
+    if (s.at_cut == null) return '';
+    if (!s.removed) return btn(s.at_cut, clock(s.at_cut));
+    return `<button class="btn" style="padding:5px 10px;font-size:13px"
+              onclick="event.stopPropagation();play(this,'${esc(e.key)}',${s.at_seconds},${s.at_seconds + 25})">
+              ▶ ${clock(s.at_seconds)} in the original</button>`;
+  };
+  const topics = idx.topics.length ? `
+    <div class="card">
+      <h2>Topics</h2>
+      ${idx.topics.map(t => `
+        <div class="item">
+          <div class="row">
+            <div class="grow">
+              <div class="title wrapline">${esc(t.title)}</div>
+              ${t.one_line ? `<div class="sub wrapline">${esc(t.one_line)}</div>` : ''}
+            </div>
+            ${jumpTopic(t)}
+          </div>
+        </div>`).join('')}
+    </div>` : '';
+  const specifics = idx.specifics.length ? `
+    <div class="card">
+      <h2>Details worth keeping</h2>
+      ${idx.specifics.map(s => `
+        <div class="item">
+          <div class="row">
+            <div class="grow">
+              <div class="title wrapline">${esc(s.value)}
+                <span class="pill">${esc(s.type)}</span>
+                ${s.confidence && s.confidence !== 'firm'
+                  ? `<span class="pill" style="color:var(--warn)">${esc(s.confidence)}</span>` : ''}
+              </div>
+              ${s.detail ? `<div class="sub wrapline">${esc(s.detail)}</div>` : ''}
+              ${s.speaker ? `<div class="sub">— ${esc(s.speaker)}</div>` : ''}
+            </div>
+            ${jumpSpecific(s)}
+          </div>
+        </div>`).join('')}
+    </div>` : '';
+  return topics + specifics;
 }
 
 async function nameIt(key, cluster) {

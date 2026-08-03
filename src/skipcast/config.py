@@ -105,7 +105,8 @@ class SummaryConfig:
     enabled: bool = True
     provider: str = "gemini"
     model: str = ""          # blank resolves to the provider's default
-    max_tokens: int = 8000
+    max_tokens: int = 16000
+    thinking: str = "low"    # gemini: minimal|low|medium|high|default
     effort: str = "high"     # anthropic only
     scope: str = "original"
 

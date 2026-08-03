@@ -31,6 +31,9 @@ class Match:
     runner_up: str | None = None
     runner_up_similarity: float = 0.0
     source: str | None = None  # which stored episode produced the best hit
+    speaker_id: int | None = None
+    # True when this feed overrides the speaker's global skip flag, either way.
+    rule_scope: str = "global"  # global | feed
 
 
 def cosine(a: list[float], b: list[float]) -> float:
@@ -77,12 +80,21 @@ def match_cluster(embedding: list[float], profiles: list[dict], threshold: float
         runner_up=runner[0] if runner else None,
         runner_up_similarity=runner[1][0] if runner else 0.0,
         source=prof["source"] if matched else None,
+        speaker_id=prof["speaker_id"] if matched else None,
     )
 
 
-def match_document(doc: dict, conn: sqlite3.Connection, cfg: Config) -> list[Match]:
-    """Match every cluster in a segments document against stored profiles."""
+def match_document(doc: dict, conn: sqlite3.Connection, cfg: Config,
+                   feed_id: int | None = None) -> list[Match]:
+    """Match every cluster in a segments document against stored profiles.
+
+    Pass feed_id wherever the episode's show is known — it is what lets a voice
+    be cut from one podcast and kept on another. Without it the global flag
+    stands, which is the right answer for a loose file being analysed on its
+    own.
+    """
     profiles = db.all_profiles(conn)
+    overrides = db.feed_rules(conn, feed_id)
     threshold = cfg.identity.match_threshold
     out = []
     for spk in doc["speakers"]:
@@ -92,6 +104,9 @@ def match_document(doc: dict, conn: sqlite3.Connection, cfg: Config) -> list[Mat
             continue
         m = match_cluster(emb, profiles, threshold)
         m.cluster_label = spk["speaker_label"]
+        if m.speaker_id is not None and m.speaker_id in overrides:
+            m.skip = overrides[m.speaker_id]
+            m.rule_scope = "feed"
         out.append(m)
     return out
 
@@ -123,6 +138,7 @@ def annotate(doc: dict, matches: list[Match]) -> dict:
         spk["matched_name"] = m.name
         spk["similarity"] = round(m.similarity, 4)
         spk["skip"] = m.skip
+        spk["rule_scope"] = m.rule_scope
         spk["closest_name"] = m.closest_name
         spk["runner_up"] = m.runner_up
         spk["runner_up_similarity"] = round(m.runner_up_similarity, 4)

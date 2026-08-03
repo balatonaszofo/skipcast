@@ -79,6 +79,7 @@ CREATE TABLE IF NOT EXISTS episodes (
     cut_speakers     TEXT,          -- comma separated names actually removed
     transcript_path  TEXT,
     summary_path     TEXT,
+    summary_json_path TEXT,        -- the machine-readable half of the summary
     summary_model    TEXT,
     status           TEXT NOT NULL, -- pending|ready|failed|refused
     error            TEXT,
@@ -88,6 +89,20 @@ CREATE TABLE IF NOT EXISTS episodes (
 );
 
 CREATE INDEX IF NOT EXISTS episodes_feed ON episodes(feed_id, published_ts DESC);
+
+-- Per-feed exceptions to speakers.skip. A voice you cut from one show is
+-- usually a voice you want kept when they turn up as a guest somewhere else,
+-- and the global flag alone cannot express that. Absence of a row means "use
+-- the global flag", which is why this holds overrides rather than every
+-- decision — subscribing to a new feed must not need N rows written to keep
+-- behaving as it did.
+CREATE TABLE IF NOT EXISTS speaker_feed_rules (
+    speaker_id INTEGER NOT NULL REFERENCES speakers(id) ON DELETE CASCADE,
+    feed_id    INTEGER NOT NULL REFERENCES feeds(id) ON DELETE CASCADE,
+    skip       INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (speaker_id, feed_id)
+);
 
 -- Where you got to in each episode. Server-side rather than in the browser so
 -- your place survives clearing site data and follows you between devices.
@@ -118,6 +133,29 @@ def db_path(cfg: Config) -> Path:
     return cfg.data_dir / "skipcast.db"
 
 
+# Columns added after the first release. CREATE TABLE IF NOT EXISTS does
+# nothing to a table that already exists, so an established database never sees
+# them without this. Adding a nullable column is the only migration shape this
+# project needs; anything structural rebuilds from the files on disk instead.
+ADDED_COLUMNS = {
+    "episodes": [("summary_json_path", "TEXT")],
+}
+
+
+def migrate(conn: sqlite3.Connection) -> list[str]:
+    """Bring an existing database up to the current schema. Idempotent."""
+    applied = []
+    for table, columns in ADDED_COLUMNS.items():
+        have = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+        for name, decl in columns:
+            if name not in have:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+                applied.append(f"{table}.{name}")
+    if applied:
+        conn.commit()
+    return applied
+
+
 def connect(cfg: Config, check_same_thread: bool = True) -> sqlite3.Connection:
     """Open the state database, creating it if needed.
 
@@ -131,6 +169,7 @@ def connect(cfg: Config, check_same_thread: bool = True) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.executescript(SCHEMA)
+    migrate(conn)
     return conn
 
 
@@ -206,6 +245,63 @@ def list_speakers(conn: sqlite3.Connection) -> list[Speaker]:
     ]
 
 
+# --- per-feed skip rules ---------------------------------------------------
+def set_feed_rule(conn: sqlite3.Connection, name: str, feed_id: int,
+                  skip: bool | None) -> bool:
+    """Override the global skip flag for one speaker on one feed.
+
+    skip=None clears the override, which is not the same as setting it to
+    False: cleared means "follow the global flag from now on", False means
+    "keep this person here even though they are cut everywhere else".
+    """
+    row = conn.execute("SELECT id FROM speakers WHERE name = ?", (name,)).fetchone()
+    if row is None:
+        return False
+    if skip is None:
+        conn.execute(
+            "DELETE FROM speaker_feed_rules WHERE speaker_id = ? AND feed_id = ?",
+            (row["id"], feed_id),
+        )
+    else:
+        conn.execute(
+            """INSERT INTO speaker_feed_rules (speaker_id, feed_id, skip, created_at)
+               VALUES (?,?,?,?)
+               ON CONFLICT(speaker_id, feed_id) DO UPDATE SET skip = excluded.skip""",
+            (row["id"], feed_id, 1 if skip else 0, _now()),
+        )
+    conn.commit()
+    return True
+
+
+def feed_rules(conn: sqlite3.Connection, feed_id: int | None) -> dict[int, bool]:
+    """Per-speaker overrides for one feed, keyed by speaker id."""
+    if feed_id is None:
+        return {}
+    return {
+        r["speaker_id"]: bool(r["skip"])
+        for r in conn.execute(
+            "SELECT speaker_id, skip FROM speaker_feed_rules WHERE feed_id = ?",
+            (feed_id,),
+        )
+    }
+
+
+def rules_by_feed(conn: sqlite3.Connection) -> list[dict]:
+    """Every override, for display."""
+    return [
+        {"speaker": r["name"], "speaker_id": r["speaker_id"], "feed_id": r["feed_id"],
+         "slug": r["slug"], "feed_title": r["feed_title"], "skip": bool(r["skip"])}
+        for r in conn.execute(
+            """SELECT r.speaker_id, r.feed_id, r.skip, s.name,
+                      f.slug, f.title AS feed_title
+                 FROM speaker_feed_rules r
+                 JOIN speakers s ON s.id = r.speaker_id
+                 JOIN feeds f ON f.id = r.feed_id
+                ORDER BY f.slug, s.name COLLATE NOCASE"""
+        )
+    ]
+
+
 def all_profiles(conn: sqlite3.Connection) -> list[dict]:
     rows = conn.execute(
         """SELECT p.id, p.speaker_id, p.source, p.cluster_label, p.embedding,
@@ -274,7 +370,7 @@ def upsert_episode(conn: sqlite3.Connection, feed_id: int, key: str, guid: str,
             "enclosure_url", "enclosure_type", "source_path", "segments_path",
             "cut_path", "cuts_path", "original_seconds", "result_seconds",
             "cut_seconds", "cut_speakers", "transcript_path", "summary_path",
-            "summary_model", "status", "error"]
+            "summary_json_path", "summary_model", "status", "error"]
     present = {k: fields[k] for k in cols if k in fields}
     row = get_episode_by_guid(conn, feed_id, guid)
     if row is None:

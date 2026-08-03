@@ -28,8 +28,8 @@ from .config import Config
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
     id          INTEGER PRIMARY KEY,
-    kind        TEXT NOT NULL,      -- poll | reprocess | recut
-    target      TEXT,               -- feed slug or episode key
+    kind        TEXT NOT NULL,      -- poll | reprocess | summarize | recut | reindex
+    target      TEXT,               -- feed slug or episode key, null for reindex
     label       TEXT,               -- human description for the UI
     params      TEXT,               -- json
     status      TEXT NOT NULL,      -- queued | running | done | failed | cancelled
@@ -269,9 +269,16 @@ class Worker:
                 ep = db.get_episode_by_key(conn, row["target"])
                 if ep is None:
                     raise ValueError(f"no episode {row['target']}")
+                # Asking for a summary means produce one now, so an existing
+                # one is replaced — but the transcript is reused unless the
+                # caller explicitly asked for the expensive half again.
                 poller.transcribe_and_summarize(
-                    conn, self.cfg, ep, force=params.get("force", False)
+                    conn, self.cfg, ep, force=params.get("force", False),
+                    resummarize=True,
                 )
+
+            elif row["kind"] == "reindex":
+                poller.reindex_transcripts(conn, self.cfg)
 
             elif row["kind"] == "recut":
                 # Re-apply the cut rules using current skip flags, without

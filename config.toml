@@ -142,7 +142,18 @@ provider = "gemini"
 # Gemini also has a free tier that may cover a single podcast entirely.
 model = ""
 
-max_tokens = 8000
+# Gemini counts thinking against this budget, so it has to cover both the
+# thinking and the summary itself or the summary gets cut off mid-sentence.
+# It also has to cover the structured JSON block, which is requested in the
+# same call — asking for it separately would mean sending the whole transcript
+# twice.
+max_tokens = 16000
+
+# Gemini only: minimal | low | medium | high | default. Summarising a
+# transcript is extraction rather than deep reasoning, and thinking bills at
+# the output rate, so "low" is the sensible default. Raise it if summaries
+# feel shallow on argument-heavy shows.
+thinking = "low"
 
 # Anthropic only; ignored by gemini.
 effort = "high"          # low | medium | high | xhigh | max

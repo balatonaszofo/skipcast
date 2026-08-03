@@ -331,6 +331,10 @@ def write_log(plan: Plan, doc: dict, cfg: Config, dest: Path) -> Path:
             "dropped_short_keeps": plan.dropped_keeps,
         },
         "cuts": [asdict(r) for r in plan.cuts],
+        # Recorded rather than left to be derived: timeline.py maps original
+        # timestamps onto the edit from this, and reconstructing the complement
+        # means re-deriving the dropped-short-keep rule from the config.
+        "keeps": [asdict(r) for r in plan.keeps],
         "decisions": [asdict(d) for d in plan.decisions],
     }
     dest.write_text(json.dumps(payload, indent=2), encoding="utf-8")

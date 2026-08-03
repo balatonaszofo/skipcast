@@ -140,8 +140,26 @@ Expect cross-show similarity to run lower than cross-episode similarity within
 one show — different mic, different room, different codec. It fails safe: an
 unrecognised voice surfaces as unknown rather than being cut by mistake.
 
-The `skip` flag is per speaker and global — marking Jason skip cuts him from
-every feed. If you ever need it scoped per feed, that is a schema change.
+### Cutting someone from one show but not another
+
+The `skip` flag is global: marking Jason skip cuts him from every feed. A
+per-feed override sits on top of it, which is what you want the first time a
+voice you cut from their own show turns up as a guest somewhere you want to
+hear them.
+
+```bash
+uv run skipcast speakers --feed the-rest-is-history --unskip "Jason Calacanis"
+uv run skipcast speakers --feed all-in --skip "Some Guest"
+uv run skipcast speakers --feed the-rest-is-history --clear "Jason Calacanis"
+```
+
+`--unskip` with `--feed` means *keep them here even though they are cut
+everywhere else*, which is not the same as `--clear`: clearing removes the
+override and hands the decision back to the global flag. `skipcast speakers`
+lists every override under the main table, and the control panel has the same
+three-way choice per speaker on each podcast's page.
+
+Overrides only affect future cuts. Episodes already processed need a re-cut.
 
 ## Phase 2 — cutting
 
@@ -256,6 +274,78 @@ changes:
 Audio is served with full HTTP Range support. Podcast clients seek, resume
 part-played episodes and fetch in chunks; without Range an 80-minute episode
 cannot be scrubbed.
+
+## Phase 4 — search and structured summaries
+
+Transcription was already happening for the summariser's benefit. These two
+make what it produced answerable.
+
+### Searching everything ever said
+
+```bash
+uv run skipcast index                      # build it from the transcripts on disk
+uv run skipcast search "margin call"
+uv run skipcast search "Elizabeth" --feed the-rest-is-history
+uv run skipcast search "nvidia*" --speaker "Jason Calacanis"
+```
+
+SQLite FTS5 over every stored transcript. Quote a phrase to search it as a
+phrase, end a word with `*` for a prefix; anything else you type is treated as
+words to find rather than query syntax, so an apostrophe or a stray `AND` does
+not become an error. The control panel has the same thing under **Search**,
+with a jump button on every hit.
+
+Indexing happens automatically at the end of each transcription. `skipcast
+index` exists for transcripts that predate it — `--missing` skips what is
+already indexed. The index is derived data and can be thrown away and rebuilt
+at any time; the panel has a **Rebuild** link for that.
+
+Hits are matched at *passage* granularity rather than per speaker turn. A
+diarized turn can run two minutes, and "where was this said" answered with the
+moment the speaker started talking is not an answer, so long turns are split at
+sentence boundaries and timed by interpolation across the turn.
+
+### Two clocks
+
+Everything downstream of diarization is timed against the original audio: the
+segments, the transcript, and every timestamp in a summary. What the phone
+plays is the cut. Those clocks diverge the moment anything is removed.
+
+So every search hit carries both — where it was said, and where that lands in
+the edited file — and the jump button uses the second. When the moment was
+removed outright, skipcast says so and offers to play it from the retained
+original instead of silently seeking somewhere else.
+
+That mapping lives in `timeline.py`, is reconstructed from the cut log, and
+accounts for crossfades: each join overlaps its two pieces, so positions after
+it shift by the crossfade length.
+
+### Structured summaries
+
+The summariser now returns its findings twice: the Markdown you read, and a
+JSON block carrying the same material in a form other things can use. It lands
+in `<episode>.summary.json` next to the prose:
+
+- `kind` and `kind_label` — the genre it decided the show was
+- `topics` — each with the timestamp that opens it, who drove it, one line on
+  what it settled
+- `specifics` — every ticker, date, figure, claim, study or product worth
+  keeping, attributed, timestamped, and marked `firm` / `hedged` / `uncertain`
+  depending on how it was said
+
+Both come out of a single request. The transcript is the expensive half of the
+call, and sending it twice to get the same facts in a different shape would
+double the cost of every episode.
+
+The episode page renders topics and specifics as jump buttons. If the model
+returns no usable JSON the prose is still saved and displayed — the block is
+stripped either way, so a summary never ends in forty lines of JSON.
+
+Episodes summarised before this existed have prose but no structure. **Summarise
+again** on the episode page backfills it. That reuses the stored transcript
+rather than re-running Whisper — a re-summarise is one API call and about a
+minute, where re-transcribing a 90-minute episode is the better part of an hour
+of CPU for a transcript that has not changed.
 
 ## Running it on another machine
 

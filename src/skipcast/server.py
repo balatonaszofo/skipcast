@@ -18,7 +18,7 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 
-from . import db, feeds, identity, jobs
+from . import db, feeds, identity, jobs, timeline
 from .config import Config
 
 _RANGE_RE = re.compile(r"bytes=(\d*)-(\d*)")
@@ -64,6 +64,24 @@ def _ranged(path: Path, request: Request, media_type: str) -> Response:
 
 def _row(r) -> dict:
     return dict(r) if r is not None else {}
+
+
+def _stamp(items: list[dict], tl: timeline.Timeline) -> list[dict]:
+    """Add edited-file positions to anything carrying an original timestamp.
+
+    Summaries and transcripts are timed against the source audio; the player
+    plays the cut. Sending both means the UI can offer a jump link that lands
+    where the listener expects, and say so when a moment was removed outright.
+    """
+    for item in items:
+        at = item.get("at_seconds")
+        if at is None:
+            item["at_cut"] = None
+            item["removed"] = False
+        else:
+            item["at_cut"] = round(tl.to_cut(float(at)), 2)
+            item["removed"] = tl.was_cut(float(at))
+    return items
 
 
 def create_app(cfg: Config) -> FastAPI:
@@ -147,18 +165,32 @@ def create_app(cfg: Config) -> FastAPI:
     def api_state():
         _need_ui()
         c = conn()
+        from . import summarize as summarizer
+
         state = {
             "base_url": cfg.serve.base_url.rstrip("/"),
             "search_enabled": cfg.serve.enable_search,
             "threshold": cfg.identity.match_threshold,
+            # Whether summarising can actually run, so the UI can say why not
+            # instead of queueing a job that fails on the API key.
+            "summary_enabled": cfg.summary.enabled,
+            "summary_provider": cfg.summary.provider,
+            "summary_ready": cfg.summary.enabled and summarizer.available(cfg),
             "feeds": [_row(r) for r in db.list_feeds(c)],
             "speakers": [
                 {"name": s.name, "skip": s.skip, "profiles": s.profile_count,
                  "total_seconds": s.total_seconds}
                 for s in db.list_speakers(c)
             ],
+            "feed_rules": db.rules_by_feed(c),
             "jobs": [_row(r) for r in jobs.recent(c, 12)],
         }
+        try:
+            from . import search
+
+            state["search"] = search.stats(c)
+        except Exception as exc:  # noqa: BLE001 — no FTS5 is not a broken panel
+            state["search"] = {"passages": 0, "episodes": 0, "error": str(exc)}
         c.close()
         return state
 
@@ -231,6 +263,55 @@ def create_app(cfg: Config) -> FastAPI:
         except discovery.SearchError as exc:
             raise HTTPException(502, str(exc)) from exc
 
+    @app.get("/api/transcripts/search")
+    def api_transcript_search(q: str, limit: int = 40, feed: str | None = None,
+                              speaker: str | None = None):
+        """Search everything ever transcribed.
+
+        Hits come back with two timestamps: where it was said in the original,
+        and where that lands in the edited audio the player serves.
+        """
+        _need_ui()
+        from . import search
+
+        c = conn()
+        try:
+            hits = search.search(c, q, limit=min(limit, 200), feed_slug=feed,
+                                 speaker=speaker)
+        except search.SearchUnavailable as exc:
+            c.close()
+            raise HTTPException(501, str(exc)) from exc
+        except ValueError as exc:
+            c.close()
+            raise HTTPException(400, str(exc)) from exc
+
+        # One timeline per episode, not per hit: a query matching forty
+        # passages in one episode would otherwise re-read the same cut log
+        # forty times.
+        timelines: dict[str, timeline.Timeline] = {}
+        out = []
+        for h in hits:
+            if h.episode_key not in timelines:
+                ep = db.get_episode_by_key(c, h.episode_key)
+                timelines[h.episode_key] = (
+                    timeline.for_episode(ep) if ep else timeline.identity_timeline()
+                )
+            tl = timelines[h.episode_key]
+            out.append({
+                "episode_key": h.episode_key,
+                "episode_title": h.episode_title,
+                "feed_slug": h.feed_slug,
+                "feed_title": h.feed_title,
+                "speaker": h.speaker,
+                "start": round(h.start, 2),
+                "at_cut": round(tl.to_cut(h.start), 2),
+                "removed": tl.was_cut(h.start),
+                "snippet_html": search.to_html(h.snippet),
+                "score": round(h.score, 3),
+            })
+        c.close()
+        return {"query": q, "count": len(out), "results": out}
+
     @app.post("/api/feeds")
     async def api_subscribe(request: Request):
         _need_ui()
@@ -280,6 +361,14 @@ def create_app(cfg: Config) -> FastAPI:
         # deleting a subscription should not silently destroy downloads.
         c.execute("DELETE FROM feeds WHERE id = ?", (row["id"],))
         c.commit()
+        # The search index sits outside that foreign key, so it has to be told
+        # separately or the results keep pointing at episodes that are gone.
+        try:
+            from . import search
+
+            search.prune(c)
+        except Exception:  # noqa: BLE001 — unsubscribing must still succeed
+            pass
         c.close()
         return {"ok": True, "note": "downloaded files were left on disk"}
 
@@ -330,7 +419,8 @@ def create_app(cfg: Config) -> FastAPI:
             # Re-match on read rather than trusting what was stored. Naming a
             # voice should light up every episode that voice appears in, not
             # only the ones processed since.
-            identity.annotate(doc, identity.match_document(doc, c, cfg))
+            identity.annotate(doc, identity.match_document(
+                doc, c, cfg, feed_id=row["feed_id"]))
             samples = pick_samples(doc)
             for i, s in enumerate(doc["speakers"]):
                 out["clusters"].append({
@@ -354,6 +444,21 @@ def create_app(cfg: Config) -> FastAPI:
         out["summary"] = (
             Path(summary).read_text() if summary and Path(summary).is_file() else None
         )
+
+        # The structured half, with every timestamp also expressed in the
+        # edited audio's clock so the UI can jump straight to it.
+        out["index"] = None
+        idx = row["summary_json_path"]
+        if idx and Path(idx).is_file():
+            try:
+                data = json.loads(Path(idx).read_text())
+                tl = timeline.for_episode(row)
+                data["topics"] = _stamp(data.get("topics") or [], tl)
+                data["specifics"] = _stamp(data.get("specifics") or [], tl)
+                out["index"] = data
+            except ValueError:
+                pass
+
         transcript = row["transcript_path"]
         out["has_transcript"] = bool(transcript and Path(transcript).is_file())
         c.close()
@@ -394,7 +499,8 @@ def create_app(cfg: Config) -> FastAPI:
             c.close()
             raise HTTPException(400, str(exc)) from exc
         # Reflect the new identity in the stored document immediately.
-        identity.annotate(doc, identity.match_document(doc, c, cfg))
+        identity.annotate(doc, identity.match_document(
+            doc, c, cfg, feed_id=row["feed_id"]))
         Path(row["segments_path"]).write_text(json.dumps(doc, indent=2),
                                               encoding="utf-8")
         c.close()
@@ -417,6 +523,29 @@ def create_app(cfg: Config) -> FastAPI:
         worker.poke()
         return {"job_id": jid}
 
+    @app.post("/api/feeds/{slug}/rules")
+    async def api_set_feed_rule(slug: str, request: Request):
+        """Cut or keep one speaker on this feed only.
+
+        skip = true / false sets an override; skip = null clears it and hands
+        the decision back to the speaker's global flag.
+        """
+        _need_ui()
+        body = await request.json()
+        name = (body.get("name") or "").strip()
+        raw = body.get("skip", None)
+        skip = None if raw is None else bool(raw)
+        c = conn()
+        feed = db.get_feed(c, slug)
+        if feed is None:
+            c.close()
+            raise HTTPException(404, "no such feed")
+        ok = db.set_feed_rule(c, name, feed["id"], skip)
+        c.close()
+        if not ok:
+            raise HTTPException(404, "unknown speaker")
+        return {"ok": True, "note": "existing episodes need a re-cut"}
+
     @app.post("/api/speakers/{name}/skip")
     async def api_set_skip(name: str, request: Request):
         _need_ui()
@@ -437,6 +566,16 @@ def create_app(cfg: Config) -> FastAPI:
         if not ok:
             raise HTTPException(404, "unknown speaker")
         return {"ok": True}
+
+    @app.post("/api/reindex")
+    def api_reindex():
+        """Rebuild the search index from the transcripts already on disk."""
+        _need_ui()
+        c = conn()
+        jid = jobs.enqueue(c, "reindex", None, "Rebuild search index")
+        c.close()
+        worker.poke()
+        return {"job_id": jid}
 
     @app.get("/api/jobs")
     def api_jobs(limit: int = 15):

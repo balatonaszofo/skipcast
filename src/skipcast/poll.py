@@ -98,7 +98,7 @@ def process_entry(conn, cfg: Config, feed_row, entry: feeds.Entry,
                 "source_url": entry.link or entry.enclosure_url,
                 "uploader": feed_row["title"],
             })
-        matches = identity.match_document(doc, conn, cfg)
+        matches = identity.match_document(doc, conn, cfg, feed_id=feed_row["id"])
         identity.annotate(doc, matches)
         segments_path.write_text(json.dumps(doc, indent=2), encoding="utf-8")
 
@@ -167,12 +167,63 @@ def process_entry(conn, cfg: Config, feed_row, entry: feeds.Entry,
         return Outcome(key, entry.title, "failed", f"{type(exc).__name__}: {exc}")
 
 
-def transcribe_and_summarize(conn, cfg: Config, ep, force: bool = False) -> None:
+def index_transcript(conn, key: str, transcript: dict) -> None:
+    """Make an episode searchable. Never fatal — the audio is the deliverable."""
+    from . import search
+
+    try:
+        n = search.index_episode(conn, key, transcript)
+        _log(f"[poll]   indexed {n} passages for search")
+    except search.SearchUnavailable as exc:
+        _log(f"[poll]   {exc}")
+    except Exception as exc:  # noqa: BLE001
+        _log(f"[poll]   could not index transcript: {exc}")
+
+
+def reindex_transcripts(conn, cfg: Config, only_missing: bool = False) -> int:
+    """Index every transcript on disk. Safe to re-run.
+
+    The index is derived data, so this is the repair path for all of it: a
+    machine that gained FTS5, a database restored without it, or transcripts
+    produced before search existed.
+    """
+    from . import search
+    from . import transcribe as stt
+
+    done = search.indexed_keys(conn) if only_missing else set()
+    rows = conn.execute(
+        "SELECT key, transcript_path FROM episodes "
+        "WHERE transcript_path IS NOT NULL ORDER BY published_ts DESC"
+    ).fetchall()
+    total = indexed = 0
+    for row in rows:
+        path = Path(row["transcript_path"] or "")
+        if not path.is_file() or (only_missing and row["key"] in done):
+            continue
+        try:
+            n = search.index_episode(conn, row["key"], stt.load(path))
+        except Exception as exc:  # noqa: BLE001 — one bad file, not the run
+            _log(f"[index] {row['key']}: {exc}")
+            continue
+        total += n
+        indexed += 1
+        _log(f"[index] {row['key']}: {n} passages")
+    _log(f"[index] {total} passages across {indexed} episode(s)")
+    return total
+
+
+def transcribe_and_summarize(conn, cfg: Config, ep, force: bool = False,
+                             resummarize: bool = False) -> None:
     """Transcribe an episode and summarise it. Never fatal to the episode.
 
     Both stages are optional extras on top of a working cut, so a Whisper crash
     or an API outage marks the episode's summary missing rather than failing an
     episode whose audio is already fine.
+
+    `force` redoes both halves. `resummarize` redoes only the summary, reusing
+    the transcript — which is what you want after a prompt change, since the
+    transcript has not changed and re-running Whisper over 90 minutes of audio
+    to get a differently-worded summary is an hour of CPU for nothing.
     """
     from . import summarize as summarizer
     from . import transcribe as stt
@@ -186,6 +237,7 @@ def transcribe_and_summarize(conn, cfg: Config, ep, force: bool = False) -> None
     ep_dir = _episode_dir(cfg)
     transcript_path = ep_dir / f"{key}.transcript.json"
     summary_path = ep_dir / f"{key}.summary.md"
+    summary_json_path = ep_dir / f"{key}.summary.json"
     doc = json.loads(segments_path.read_text())
 
     if cfg.transcribe.enabled:
@@ -207,15 +259,20 @@ def transcribe_and_summarize(conn, cfg: Config, ep, force: bool = False) -> None
     else:
         return
 
+    index_transcript(conn, key, transcript)
+
     if not cfg.summary.enabled:
         return
     if not summarizer.available(cfg):
         _log(f"[poll]   {summarizer.missing_key_message(cfg.summary.provider)}")
         return
-    if summary_path.is_file() and not force:
+    if summary_path.is_file() and not (force or resummarize):
         _log("[poll]   reusing existing summary")
-        db.upsert_episode(conn, ep["feed_id"], key, ep["guid"],
-                          {"summary_path": str(summary_path)})
+        db.upsert_episode(conn, ep["feed_id"], key, ep["guid"], {
+            "summary_path": str(summary_path),
+            "summary_json_path": (str(summary_json_path)
+                                  if summary_json_path.is_file() else None),
+        })
         return
 
     cut_note = ""
@@ -237,8 +294,16 @@ def transcribe_and_summarize(conn, cfg: Config, ep, force: bool = False) -> None
             note=cut_note,
         )
         summary_path.write_text(result.markdown, encoding="utf-8")
+        # Timestamps are stored as the summariser gave them: seconds into the
+        # original audio. Mapping them onto the edit happens on read, because a
+        # recut moves every one of them and stored positions would go stale.
+        if result.data:
+            summary_json_path.write_text(json.dumps(result.data, indent=2),
+                                         encoding="utf-8")
         db.upsert_episode(conn, ep["feed_id"], key, ep["guid"], {
             "summary_path": str(summary_path),
+            "summary_json_path": (str(summary_json_path)
+                                  if result.data else None),
             "summary_model": result.model,
         })
     except Exception as exc:  # noqa: BLE001
@@ -277,7 +342,9 @@ def recut_episode(conn, cfg: Config, ep) -> Outcome:
         )
 
     doc = json.loads(segments_path.read_text())
-    identity.annotate(doc, identity.match_document(doc, conn, cfg))
+    identity.annotate(doc,
+                      identity.match_document(doc, conn, cfg,
+                                              feed_id=ep["feed_id"]))
     segments_path.write_text(json.dumps(doc, indent=2), encoding="utf-8")
 
     cut_path = Path(ep["cut_path"] or (_episode_dir(cfg) / f"{key}.cut.mp3"))

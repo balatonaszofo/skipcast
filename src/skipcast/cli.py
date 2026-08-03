@@ -171,6 +171,13 @@ def _cmd_label(args: argparse.Namespace) -> int:
     return 0
 
 
+def _report(ok: bool, name: str, done: str) -> None:
+    if ok:
+        print(done)
+    else:
+        print(f"unknown speaker: {name}", file=sys.stderr)
+
+
 def _cmd_speakers(args: argparse.Namespace) -> int:
     from .config import load_config
     from . import db
@@ -178,18 +185,38 @@ def _cmd_speakers(args: argparse.Namespace) -> int:
     cfg = load_config(args.config)
     conn = db.connect(cfg)
 
+    # With --feed, skip/unskip write an override for that show only; without
+    # it they set the global flag, which is what they have always done.
+    feed_id = None
+    if args.feed:
+        feed = db.get_feed(conn, args.feed)
+        if feed is None:
+            print(f"error: no feed with slug '{args.feed}'", file=sys.stderr)
+            conn.close()
+            return 1
+        feed_id = feed["id"]
+    if args.clear and not args.feed:
+        print("error: --clear removes a per-feed override, so it needs --feed",
+              file=sys.stderr)
+        conn.close()
+        return 1
+
+    def apply(name: str, skip: bool | None) -> bool:
+        if feed_id is None:
+            return db.set_skip(conn, name, bool(skip))
+        return db.set_feed_rule(conn, name, feed_id, skip)
+
+    where = f" on {args.feed}" if args.feed else ""
     changed = False
     for name in args.skip or []:
-        if db.set_skip(conn, name, True):
-            print(f"skip: {name}")
-        else:
-            print(f"unknown speaker: {name}", file=sys.stderr)
+        _report(apply(name, True), name, f"skip: {name}{where}")
         changed = True
     for name in args.unskip or []:
-        if db.set_skip(conn, name, False):
-            print(f"keep: {name}")
-        else:
-            print(f"unknown speaker: {name}", file=sys.stderr)
+        _report(apply(name, False), name, f"keep: {name}{where}")
+        changed = True
+    for name in args.clear or []:
+        _report(apply(name, None), name,
+                f"cleared: {name}{where}, now follows the global flag")
         changed = True
     for name in args.forget or []:
         if db.forget(conn, name):
@@ -211,6 +238,92 @@ def _cmd_speakers(args: argparse.Namespace) -> int:
         mins = s.total_seconds / 60
         print(f"{'  X   ' if s.skip else '      '}{s.name:<24}"
               f"{s.profile_count:>8}{mins:>10.1f}m")
+
+    rules = db.rules_by_feed(conn)
+    if rules:
+        print("\nper-feed overrides (these win over the global flag):")
+        for r in rules:
+            verb = "cut from" if r["skip"] else "kept on"
+            print(f"  {r['speaker']:<24} {verb} {r['slug']}")
+    conn.close()
+    return 0
+
+
+def _cmd_search(args: argparse.Namespace) -> int:
+    from .config import load_config
+    from . import db, search, timeline
+
+    cfg = load_config(args.config)
+    conn = db.connect(cfg)
+    try:
+        hits = search.search(conn, args.query, limit=args.limit,
+                             feed_slug=args.feed, speaker=args.speaker)
+    except search.SearchUnavailable as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        conn.close()
+        return 1
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        conn.close()
+        return 1
+
+    if not hits:
+        indexed = search.stats(conn)
+        if not indexed["episodes"]:
+            print("Nothing is indexed yet. Run: skipcast index")
+        else:
+            print(f"No matches in {indexed['episodes']} indexed episode(s).")
+        conn.close()
+        return 0
+
+    def hms(t: float) -> str:
+        return f"{int(t) // 3600:d}:{int(t) % 3600 // 60:02d}:{int(t) % 60:02d}" \
+            if t >= 3600 else f"{int(t) // 60:d}:{int(t) % 60:02d}"
+
+    timelines: dict[str, timeline.Timeline] = {}
+    for h in hits:
+        if h.episode_key not in timelines:
+            ep = db.get_episode_by_key(conn, h.episode_key)
+            timelines[h.episode_key] = (
+                timeline.for_episode(ep) if ep else timeline.identity_timeline()
+            )
+        tl = timelines[h.episode_key]
+        # Both clocks: the original is where it was said, the edit is where to
+        # seek to in what actually gets served.
+        cut_at = f"  edit {hms(tl.to_cut(h.start))}"
+        if tl.was_cut(h.start):
+            cut_at = "  [removed from your copy]"
+        print(f"{hms(h.start)}{cut_at}")
+        print(f"  {h.speaker} — {h.episode_title[:60]} ({h.feed_slug})")
+        text = h.snippet.replace(search.MARK_OPEN, "\033[1m") \
+                        .replace(search.MARK_CLOSE, "\033[0m") \
+            if sys.stdout.isatty() else \
+            h.snippet.replace(search.MARK_OPEN, "").replace(search.MARK_CLOSE, "")
+        print(f"  {text}")
+        print()
+    print(f"{len(hits)} hit(s)")
+    conn.close()
+    return 0
+
+
+def _cmd_index(args: argparse.Namespace) -> int:
+    from .config import load_config
+    from . import db, poll as poller, search
+
+    cfg = load_config(args.config)
+    conn = db.connect(cfg)
+    try:
+        search.ensure_schema(conn)
+    except search.SearchUnavailable as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        conn.close()
+        return 1
+    poller.reindex_transcripts(conn, cfg, only_missing=args.missing)
+    search.prune(conn)
+    stats = search.stats(conn)
+    print(f"\n{stats['passages']} passages from {stats['episodes']} episode(s) "
+          "are searchable")
+    print("Try: skipcast search \"<something said>\"")
     conn.close()
     return 0
 
@@ -530,9 +643,33 @@ def build_parser() -> argparse.ArgumentParser:
                           help="mark a speaker to be cut (repeatable)")
     speakers.add_argument("--unskip", action="append", metavar="NAME",
                           help="stop cutting a speaker (repeatable)")
+    speakers.add_argument("--feed", default=None, metavar="SLUG",
+                          help="scope --skip/--unskip to one podcast instead of "
+                               "every feed")
+    speakers.add_argument("--clear", action="append", metavar="NAME",
+                          help="drop a speaker's override on --feed, so the "
+                               "global flag applies again")
     speakers.add_argument("--forget", action="append", metavar="NAME",
                           help="delete a speaker and all their voice profiles")
     speakers.set_defaults(func=_cmd_speakers)
+
+    search_p = sub.add_parser(
+        "search", help="full-text search across every transcript"
+    )
+    search_p.add_argument("query",
+                          help='words to find; quote a phrase, trail a * for prefix')
+    search_p.add_argument("--feed", default=None, help="only this feed slug")
+    search_p.add_argument("--speaker", default=None,
+                          help="only passages attributed to this speaker")
+    search_p.add_argument("--limit", type=int, default=20)
+    search_p.set_defaults(func=_cmd_search)
+
+    index_p = sub.add_parser(
+        "index", help="build the search index from transcripts already on disk"
+    )
+    index_p.add_argument("--missing", action="store_true",
+                         help="only episodes not indexed yet, rather than all")
+    index_p.set_defaults(func=_cmd_index)
 
     cut_p = sub.add_parser(
         "cut", help="produce an edited audio file with the skipped speakers removed"

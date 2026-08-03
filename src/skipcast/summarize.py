@@ -14,9 +14,11 @@ out what kind of show it is first, then extract accordingly.
 
 from __future__ import annotations
 
+import json
 import os
+import re
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from .config import Config
 
@@ -108,7 +110,50 @@ on. Attribute each item to whoever said it. If the episode genuinely has no \
 such specifics, write one line saying so and move on.
 
 ## Worth knowing
-Three to eight bullets a listener would want to remember, each attributed."""
+Three to eight bullets a listener would want to remember, each attributed.
+
+{index_block}"""
+
+# Asked for in the same call as the prose rather than a second one: the
+# transcript is the expensive half of the request, and sending it twice to get
+# the same facts in a different shape doubles the cost of every episode.
+INDEX_BLOCK = """Then, after the Markdown and separated from it, emit one \
+fenced code block tagged `json` and nothing after it. It carries the same \
+findings in machine-readable form, for search and cross-episode indexing:
+
+```json
+{
+  "kind": "one of: markets, history, news, technology, science, interview, \
+truecrime, sports, culture, other",
+  "kind_label": "how you would describe this show in three or four words",
+  "topics": [
+    {"title": "short topic name", "at": "12:34",
+     "speakers": ["who drove this topic"],
+     "one_line": "what it settled, in one sentence"}
+  ],
+  "specifics": [
+    {"type": "ticker | company | price_target | position | prediction | date | \
+figure | claim | study | product | person | place | recommendation | other",
+     "value": "the thing itself, short — NVDA, 1588, Ozempic, Battle of Lepanto",
+     "detail": "what was actually said about it, one sentence",
+     "speaker": "who said it, or the cluster label if unnamed",
+     "at": "12:34",
+     "confidence": "firm | hedged | uncertain"}
+  ]
+}
+```
+
+Rules for that block:
+- `at` is the timestamp from the transcript, copied verbatim — `12:34` or \
+`1:02:33`. Never estimate one; omit the field if the transcript does not show it.
+- `topics` must match the `###` headings above, in the same order.
+- `specifics` covers the same ground as the specifics section — every ticker, \
+date, figure, claim or call worth remembering, one entry each. Twenty is a lot; \
+an episode with none gets an empty list.
+- `confidence` is about how the speaker said it: `firm` for a stated position, \
+`hedged` for thinking out loud, `uncertain` where the transcript itself looks \
+garbled.
+- Attribute to a real transcript speaker, or omit `speaker`. Never invent a name."""
 
 
 class SummaryError(RuntimeError):
@@ -121,7 +166,12 @@ class Summary:
     provider: str
     model: str
     input_tokens: int
-    output_tokens: int
+    output_tokens: int   # includes thinking, which bills at the output rate
+    thinking_tokens: int = 0
+    # Parsed from the JSON block. Empty when the model did not produce one or
+    # produced something unparseable — the prose is the deliverable, the
+    # structure is what makes it queryable.
+    data: dict = field(default_factory=dict)
 
     @property
     def approx_cost_usd(self) -> float:
@@ -160,7 +210,8 @@ def _resolve_model(cfg: Config) -> str:
 
 
 def _build_prompt(transcript_text: str, title: str, show: str | None,
-                  show_description: str | None, note: str) -> str:
+                  show_description: str | None, note: str,
+                  structured: bool = True) -> str:
     show_block = ""
     if show:
         show_block = f"Show: {show}\n"
@@ -173,7 +224,91 @@ def _build_prompt(transcript_text: str, title: str, show: str | None,
         note=note or "Summarise the whole episode.",
         transcript=transcript_text,
         specifics="Specifics",
+        index_block=INDEX_BLOCK if structured else "",
     )
+
+
+# ---- structured block ------------------------------------------------------
+_FENCE = re.compile(r"```(?:json)?\s*\n(.*?)\n?```\s*$", re.DOTALL | re.IGNORECASE)
+_STAMP = re.compile(r"(?:(\d{1,2}):)?(\d{1,3}):([0-5]\d)")
+
+
+def timestamp_seconds(value) -> float | None:
+    """Parse a transcript timestamp — 12:34, 1:02:33 — into seconds.
+
+    Models hand back all sorts of things here: a range, a stamp in brackets, a
+    bare number of minutes. Anything that does not clearly resolve returns None
+    rather than a confident wrong number, because these become jump links.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value) if value >= 0 else None
+    m = _STAMP.search(str(value))
+    if not m:
+        return None
+    hours, minutes, seconds = m.group(1), int(m.group(2)), int(m.group(3))
+    return float(int(hours or 0) * 3600 + minutes * 60 + seconds)
+
+
+def split_structured(text: str) -> tuple[str, dict]:
+    """Separate the prose from the trailing JSON block.
+
+    The prose is what a person reads, so the block is stripped out of it
+    whether or not it parsed — a summary ending in forty lines of JSON is worse
+    than one with no index at all.
+    """
+    m = _FENCE.search(text.strip())
+    if not m:
+        return text.strip(), {}
+    prose = text[:m.start()].strip()
+    try:
+        data = json.loads(m.group(1))
+    except ValueError:
+        return prose, {}
+    if not isinstance(data, dict):
+        return prose, {}
+    return prose, normalize_index(data)
+
+
+def normalize_index(data: dict) -> dict:
+    """Resolve timestamps to seconds and drop entries that carry nothing.
+
+    Everything here is defensive: this data is model output, and it feeds jump
+    links and, later, a cross-episode index.
+    """
+    out: dict = {
+        "kind": str(data.get("kind") or "other")[:40],
+        "kind_label": str(data.get("kind_label") or "")[:80],
+        "topics": [],
+        "specifics": [],
+    }
+    for t in data.get("topics") or []:
+        if not isinstance(t, dict) or not (t.get("title") or "").strip():
+            continue
+        out["topics"].append({
+            "title": str(t["title"]).strip()[:200],
+            "at": str(t.get("at") or "").strip()[:12],
+            "at_seconds": timestamp_seconds(t.get("at")),
+            "speakers": [str(s)[:80] for s in (t.get("speakers") or [])
+                         if isinstance(s, (str, int, float))][:8],
+            "one_line": str(t.get("one_line") or "").strip()[:400],
+        })
+    for s in data.get("specifics") or []:
+        if not isinstance(s, dict) or not (s.get("value") or "").strip():
+            continue
+        confidence = str(s.get("confidence") or "").strip().lower()
+        out["specifics"].append({
+            "type": str(s.get("type") or "other").strip().lower()[:40],
+            "value": str(s["value"]).strip()[:120],
+            "detail": str(s.get("detail") or "").strip()[:500],
+            "speaker": str(s.get("speaker") or "").strip()[:80],
+            "at": str(s.get("at") or "").strip()[:12],
+            "at_seconds": timestamp_seconds(s.get("at")),
+            "confidence": confidence if confidence in ("firm", "hedged", "uncertain")
+                          else "",
+        })
+    return out
 
 
 # ---- providers -------------------------------------------------------------
@@ -186,6 +321,23 @@ def _summarize_gemini(prompt: str, cfg: Config) -> Summary:
 
     model = _resolve_model(cfg)
     client = genai.Client(api_key=api_key("gemini"))
+
+    # Gemini 3.x thinks by default, and thinking counts against
+    # max_output_tokens — a trivial two-line summary spent 350 of a 400 token
+    # budget on thinking and returned 36 tokens of text. Left alone, a real
+    # summary gets silently truncated. Summarising a transcript is extraction
+    # rather than deep reasoning, so keep thinking low and budget for it.
+    thinking = None
+    level = (cfg.summary.thinking or "").strip().upper()
+    if level and level != "DEFAULT":
+        try:
+            thinking = types.ThinkingConfig(thinking_level=level)
+        except Exception as exc:  # noqa: BLE001
+            raise SummaryError(
+                f"invalid [summary] thinking value '{cfg.summary.thinking}' — "
+                "use minimal, low, medium, high, or default"
+            ) from exc
+
     try:
         response = client.models.generate_content(
             model=model,
@@ -193,6 +345,7 @@ def _summarize_gemini(prompt: str, cfg: Config) -> Summary:
             config=types.GenerateContentConfig(
                 system_instruction=SYSTEM,
                 max_output_tokens=cfg.summary.max_tokens,
+                thinking_config=thinking,
             ),
         )
     except Exception as exc:  # noqa: BLE001 — SDK raises a wide variety
@@ -221,13 +374,26 @@ def _summarize_gemini(prompt: str, cfg: Config) -> Summary:
             + (f" (finish_reason: {finish})" if finish and not reason else "")
         )
 
+    # A summary cut off mid-sentence is worse than none — it looks complete.
+    finish = str(getattr(response.candidates[0], "finish_reason", "") or "")
+    if "MAX_TOKENS" in finish:
+        raise SummaryError(
+            f"summary hit the {cfg.summary.max_tokens}-token ceiling and was "
+            "truncated. Raise [summary] max_tokens, or lower [summary] thinking "
+            "— thinking tokens come out of the same budget."
+        )
+
     usage = getattr(response, "usage_metadata", None)
+    # Thinking tokens are billed at the output rate, so count them in the cost.
+    visible = getattr(usage, "candidates_token_count", 0) or 0
+    thoughts = getattr(usage, "thoughts_token_count", 0) or 0
     return Summary(
         markdown=text,
         provider="gemini",
         model=model,
         input_tokens=getattr(usage, "prompt_token_count", 0) or 0,
-        output_tokens=getattr(usage, "candidates_token_count", 0) or 0,
+        output_tokens=visible + thoughts,
+        thinking_tokens=thoughts,
     )
 
 
@@ -284,7 +450,7 @@ def _summarize_anthropic(prompt: str, cfg: Config) -> Summary:
 
 def summarize(transcript_text: str, title: str, cfg: Config,
               show: str | None = None, show_description: str | None = None,
-              note: str = "") -> Summary:
+              note: str = "", structured: bool = True) -> Summary:
     provider = cfg.summary.provider
     if provider not in ("gemini", "anthropic"):
         raise SummaryError(
@@ -293,14 +459,34 @@ def summarize(transcript_text: str, title: str, cfg: Config,
     if not api_key(provider):
         raise SummaryError(missing_key_message(provider))
 
-    prompt = _build_prompt(transcript_text, title, show, show_description, note)
+    prompt = _build_prompt(transcript_text, title, show, show_description, note,
+                           structured=structured)
     runner = _summarize_gemini if provider == "gemini" else _summarize_anthropic
     result = runner(prompt, cfg)
 
+    if structured:
+        result.markdown, result.data = split_structured(result.markdown)
+
     cost = result.approx_cost_usd
+    thinking = (
+        f" ({result.thinking_tokens} thinking)" if result.thinking_tokens else ""
+    )
     print(
-        f"[summary] {result.model}: {result.output_tokens} tokens out"
+        f"[summary] {result.model}: {result.output_tokens} tokens out{thinking}"
         + (f", ~${cost:.3f}" if cost else ""),
         file=sys.stderr,
     )
+    if structured:
+        if result.data:
+            print(
+                f"[summary] indexed {len(result.data['topics'])} topics, "
+                f"{len(result.data['specifics'])} specifics "
+                f"({result.data.get('kind_label') or result.data['kind']})",
+                file=sys.stderr,
+            )
+        else:
+            # Worth saying out loud: the prose is fine, but this episode will
+            # have no topic jump links and nothing for the index to read.
+            print("[summary] no structured block returned — prose only",
+                  file=sys.stderr)
     return result
