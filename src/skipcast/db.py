@@ -77,7 +77,13 @@ CREATE TABLE IF NOT EXISTS episodes (
     result_seconds   REAL,
     cut_seconds      REAL,
     interstitial_seconds REAL,      -- of cut_seconds, how much was ads etc
+    topic_seconds    REAL,          -- of cut_seconds, how much was skipped topics
     cut_speakers     TEXT,          -- comma separated names actually removed
+    cut_topics       TEXT,          -- comma separated skipped terms actually cut
+    -- Set when skips would have gutted the episode, so nothing was cut and the
+    -- listener gets to decide instead. Cleared by choosing to listen anyway.
+    skip_note        TEXT,
+    hidden           INTEGER,       -- dropped from Listen, files left on disk
     transcript_path  TEXT,
     summary_path     TEXT,
     summary_json_path TEXT,        -- the machine-readable half of the summary
@@ -181,14 +187,31 @@ CREATE TABLE IF NOT EXISTS topics (
 
 CREATE INDEX IF NOT EXISTS topics_episode ON topics(episode_id);
 
--- Terms worth being told about. seen_at is what makes "new since last time"
--- mean anything; without it every check reports the same hits forever.
+-- Terms you have an opinion about, in either direction. state is 'watch' —
+-- tell me when this comes up — or 'skip' — cut the chapters that are about it.
+-- One table because they are one concept pointing two ways, and because a term
+-- you stop watching is usually a term you are about to start skipping.
+-- seen_at is what makes "new since last time" mean anything for watched terms;
+-- without it every check reports the same hits forever.
 CREATE TABLE IF NOT EXISTS watchlist (
     id         INTEGER PRIMARY KEY,
     term       TEXT NOT NULL,
     term_norm  TEXT NOT NULL UNIQUE,
+    state      TEXT,               -- 'watch' | 'skip'; null reads as 'watch'
     created_at TEXT NOT NULL,
     seen_at    TEXT
+);
+
+-- Per-feed exceptions to a term's skip state, the same shape as
+-- speaker_feed_rules and for the same reason: a subject you never want from
+-- one show is often the subject you subscribed to another show for. Absence
+-- of a row means "use the global state".
+CREATE TABLE IF NOT EXISTS topic_feed_rules (
+    term_norm  TEXT NOT NULL,
+    feed_id    INTEGER NOT NULL REFERENCES feeds(id) ON DELETE CASCADE,
+    skip       INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (term_norm, feed_id)
 );
 
 -- Digests: one audio file assembled from topic-sized pieces of several
@@ -203,6 +226,7 @@ CREATE TABLE IF NOT EXISTS digests (
     seconds     REAL,              -- what it actually came out at
     audio_path  TEXT,
     pieces      TEXT,              -- json: what went in, in order
+    theme       TEXT,              -- which shows this digest drew from, and why
     created_at  TEXT NOT NULL
 );
 
@@ -240,8 +264,12 @@ def db_path(cfg: Config) -> Path:
 # them without this. Adding a nullable column is the only migration shape this
 # project needs; anything structural rebuilds from the files on disk instead.
 ADDED_COLUMNS = {
-    "episodes": [("summary_json_path", "TEXT"), ("interstitial_seconds", "REAL")],
+    "episodes": [("summary_json_path", "TEXT"), ("interstitial_seconds", "REAL"),
+                 ("topic_seconds", "REAL"), ("cut_topics", "TEXT"),
+                 ("skip_note", "TEXT"), ("hidden", "INTEGER")],
     "entities": [("evidence", "TEXT")],
+    "digests": [("theme", "TEXT")],
+    "watchlist": [("state", "TEXT")],
 }
 
 
@@ -479,16 +507,24 @@ def get_episode_by_guid(conn: sqlite3.Connection, feed_id: int, guid: str):
 
 
 def get_episode_by_key(conn: sqlite3.Connection, key: str):
-    return conn.execute("SELECT * FROM episodes WHERE key = ?", (key,)).fetchone()
+    return conn.execute(
+        """SELECT e.*, f.slug AS feed_slug, f.title AS feed_title
+             FROM episodes e JOIN feeds f ON f.id = e.feed_id
+            WHERE e.key = ?""",
+        (key,),
+    ).fetchone()
 
 
 def upsert_episode(conn: sqlite3.Connection, feed_id: int, key: str, guid: str,
                    fields: dict) -> int:
     """Idempotent on (feed_id, guid) — the whole point of poll being re-runnable."""
+    # Every writable column has to be named here: anything missing is dropped
+    # in silence, which looks exactly like a write that did not happen.
     cols = ["title", "description", "link", "published", "published_ts",
             "enclosure_url", "enclosure_type", "source_path", "segments_path",
             "cut_path", "cuts_path", "original_seconds", "result_seconds",
-            "cut_seconds", "interstitial_seconds", "cut_speakers",
+            "cut_seconds", "interstitial_seconds", "topic_seconds",
+            "cut_speakers", "cut_topics", "skip_note", "hidden",
             "transcript_path", "summary_path",
             "summary_json_path", "summary_model", "status", "error"]
     present = {k: fields[k] for k in cols if k in fields}
@@ -642,11 +678,17 @@ def positions(conn: sqlite3.Connection) -> dict[str, dict]:
 
 
 def ready_episodes(conn: sqlite3.Connection, limit: int = 100):
-    """Everything playable, newest first, across every feed."""
+    """Everything playable, newest first, across every feed.
+
+    Hidden episodes are dropped ones — mostly about a subject being skipped,
+    and answered with "not for me". They stay on disk and stay reachable from
+    their show, they just do not queue themselves up to be listened to.
+    """
     return conn.execute(
         """SELECT e.*, f.slug AS feed_slug, f.title AS feed_title
              FROM episodes e JOIN feeds f ON f.id = e.feed_id
             WHERE e.status = 'ready' AND e.cut_path IS NOT NULL
+              AND COALESCE(e.hidden, 0) = 0
             ORDER BY e.published_ts DESC, e.id DESC LIMIT ?""",
         (limit,),
     ).fetchall()

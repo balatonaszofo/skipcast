@@ -206,8 +206,53 @@ def selected_interstitials(cfg: Config, data: dict) -> list[dict]:
     ]
 
 
-def apply_interstitials(conn, cfg: Config, ep, data: dict) -> float:
-    """Re-cut an episode with its ad reads and housekeeping removed.
+# A skip that would take more than this much of an episode is not an edit, it
+# is a verdict on the whole episode — so nothing is cut and the listener is
+# asked instead.
+GUT_FRACTION = 0.6
+
+
+def topic_cut_ranges(conn, ep) -> list[dict]:
+    """Chapters of this episode that are about something being skipped.
+
+    Shaped like the interstitial ranges so both go through one path: whatever
+    guarantees the ad cuts get — padding, union, the ceiling — these get too.
+    """
+    from . import entities
+
+    out = []
+    for ch in entities.skipped_chapters(conn, ep["id"], ep["feed_id"]):
+        out.append({
+            "from_seconds": ch["start_seconds"],
+            "to_seconds": ch["end_seconds"],
+            "seconds": ch["seconds"],
+            "kind": cutter.TOPIC_KIND,
+            "term": ch["terms"][0],
+            "what": f"{ch['title']} — skipped: {', '.join(ch['terms'])}",
+            "confidence": "certain",
+        })
+    return out
+
+
+def extra_cut_ranges(conn, cfg: Config, ep, data: dict | None = None) -> list[dict]:
+    """Everything to remove from this episode that is not about who is talking.
+
+    One function because there is one answer, and because the two callers that
+    need it — the pass after summarising and a plain recut — must agree. When
+    they disagreed, a recut quietly put the ads back.
+    """
+    if data is None:
+        path = Path(ep["summary_json_path"] or "")
+        if path.is_file():
+            try:
+                data = json.loads(path.read_text())
+            except ValueError:
+                data = None
+    return selected_interstitials(cfg, data or {}) + topic_cut_ranges(conn, ep)
+
+
+def apply_extra_cuts(conn, cfg: Config, ep, data: dict | None = None) -> float:
+    """Re-cut an episode with its ads and skipped chapters removed.
 
     This runs after the episode is already playable, because the ranges come
     from the transcript and the transcript comes from the audio. So it is a
@@ -215,7 +260,7 @@ def apply_interstitials(conn, cfg: Config, ep, data: dict) -> float:
     also means it is optional, restartable, and cannot cost you the episode if
     it fails.
     """
-    ranges = selected_interstitials(cfg, data)
+    ranges = extra_cut_ranges(conn, cfg, ep, data)
     if not ranges:
         return 0.0
 
@@ -224,29 +269,50 @@ def apply_interstitials(conn, cfg: Config, ep, data: dict) -> float:
     if not segments_path.is_file() or not source.is_file():
         return 0.0
 
-    total = sum(r["seconds"] for r in ranges)
+    key = ep["key"]
     duration = float(ep["original_seconds"] or 0) or 1.0
-    if total / duration > cfg.interstitial.max_fraction:
-        _log(f"[poll]   {total / 60:.1f} min of interstitials is "
-             f"{total / duration * 100:.0f}% of the episode, over the "
-             f"{cfg.interstitial.max_fraction * 100:.0f}% ceiling — leaving them in")
-        return 0.0
+    ads = [r for r in ranges if r["kind"] != cutter.TOPIC_KIND]
+    topics = [r for r in ranges if r["kind"] == cutter.TOPIC_KIND]
 
+    ad_total = sum(r["seconds"] for r in ads)
+    if ad_total / duration > cfg.interstitial.max_fraction:
+        _log(f"[poll]   {ad_total / 60:.1f} min of interstitials is "
+             f"{ad_total / duration * 100:.0f}% of the episode, over the "
+             f"{cfg.interstitial.max_fraction * 100:.0f}% ceiling — leaving them in")
+        ads = []
+
+    # An episode that is mostly about a skipped subject is not something to
+    # quietly hollow out. Leave it whole, say so, and let the listener decide.
+    note = None
+    topic_total = sum(r["seconds"] for r in topics)
+    if topics and topic_total / duration > GUT_FRACTION:
+        pct = round(topic_total / duration * 100)
+        terms = sorted({r["term"] for r in topics})
+        note = f"{pct}% of this episode is about {', '.join(terms)}"
+        _log(f"[poll]   {note} — not cutting, asking instead")
+        topics = []
+
+    ranges = ads + topics
     doc = json.loads(segments_path.read_text())
     identity.annotate(doc, identity.match_document(doc, conn, cfg,
                                                    feed_id=ep["feed_id"]))
-    key = ep["key"]
     cut_path = Path(ep["cut_path"] or (_episode_dir(cfg) / f"{key}.cut.mp3"))
     cuts_path = Path(ep["cuts_path"] or (_episode_dir(cfg) / f"{key}.cuts.json"))
 
     try:
         plan = cutter.build_plan(doc, cfg, extra_cuts=ranges)
     except cutter.CutRefused as exc:
-        _log(f"[poll]   not removing interstitials: {exc}")
+        _log(f"[poll]   not removing extra cuts: {exc}")
         return 0.0
 
-    kinds = ", ".join(sorted({r["kind"] for r in ranges}))
-    _log(f"[poll]   re-cutting to drop {total / 60:.1f} min of {kinds}")
+    if ranges:
+        what = []
+        if plan.interstitial_seconds > 1:
+            what.append(f"{plan.interstitial_seconds / 60:.1f} min of ads")
+        if plan.topic_seconds > 1:
+            what.append(f"{plan.topic_seconds / 60:.1f} min of "
+                        f"{', '.join(plan.cut_topics)}")
+        _log(f"[poll]   re-cutting to drop {' and '.join(what) or 'nothing extra'}")
     cutter.write_log(plan, doc, cfg, cuts_path)
     cutter.render(source, plan, cfg, cut_path)
 
@@ -256,8 +322,11 @@ def apply_interstitials(conn, cfg: Config, ep, data: dict) -> float:
         "result_seconds": audio.duration_seconds(cut_path),
         "cut_seconds": plan.cut_seconds,
         "interstitial_seconds": plan.interstitial_seconds,
+        "topic_seconds": plan.topic_seconds,
+        "cut_topics": ", ".join(plan.cut_topics),
+        "skip_note": note,
     })
-    return plan.interstitial_seconds
+    return plan.interstitial_seconds + plan.topic_seconds
 
 
 def index_entities(conn, episode_id: int, data: dict,
@@ -405,9 +474,9 @@ def transcribe_and_summarize(conn, cfg: Config, ep, force: bool = False,
             try:
                 # Refetch: the summary write above changed the row this needs.
                 fresh = db.get_episode_by_key(conn, key)
-                apply_interstitials(conn, cfg, fresh, result.data)
+                apply_extra_cuts(conn, cfg, fresh, result.data)
             except Exception as exc:  # noqa: BLE001 — the cut we have is fine
-                _log(f"[poll]   could not remove interstitials: {exc}")
+                _log(f"[poll]   could not remove ads or skipped chapters: {exc}")
     except Exception as exc:  # noqa: BLE001
         _log(f"[poll]   summary failed: {exc}")
 
@@ -430,9 +499,16 @@ def entry_from_row(row) -> feeds.Entry:
 def recut_episode(conn, cfg: Config, ep) -> Outcome:
     """Re-apply the cut rules to an already-diarized episode.
 
-    Changing who is flagged skip, or a cut parameter, does not need the
-    download or the diarization again — those are the expensive halves. This
-    re-matches identities against the current database and re-renders.
+    Changing who is flagged skip, or which subjects are skipped, or a cut
+    parameter, does not need the download or the diarization again — those are
+    the expensive halves. This re-matches identities against the current
+    database and re-renders.
+
+    Everything the episode had removed is re-derived here, not just the
+    speakers: the ads found in its transcript and the chapters about skipped
+    subjects. A recut that rebuilt only the speaker cuts used to hand back an
+    episode with its ad reads restored, while the database went on claiming
+    they were gone.
     """
     key = ep["key"]
     segments_path = Path(ep["segments_path"] or "")
@@ -452,15 +528,32 @@ def recut_episode(conn, cfg: Config, ep) -> Outcome:
     cut_path = Path(ep["cut_path"] or (_episode_dir(cfg) / f"{key}.cut.mp3"))
     cuts_path = Path(ep["cuts_path"] or (_episode_dir(cfg) / f"{key}.cuts.json"))
 
-    plan = cutter.build_plan(doc, cfg)
+    duration = float(ep["original_seconds"] or 0) or 1.0
+    extras = extra_cut_ranges(conn, cfg, ep)
+    topics = [r for r in extras if r["kind"] == cutter.TOPIC_KIND]
+    note = None
+    topic_total = sum(r["seconds"] for r in topics)
+    if topics and topic_total / duration > GUT_FRACTION:
+        pct = round(topic_total / duration * 100)
+        terms = sorted({r["term"] for r in topics})
+        note = f"{pct}% of this episode is about {', '.join(terms)}"
+        _log(f"[recut] {note} — not cutting those chapters, asking instead")
+        extras = [r for r in extras if r["kind"] != cutter.TOPIC_KIND]
+
+    plan = cutter.build_plan(doc, cfg, extra_cuts=extras)
     cutter.write_log(plan, doc, cfg, cuts_path)
     names = sorted({
         (next(s for s in doc["speakers"] if s["speaker_label"] == label)
          .get("matched_name") or label)
         for label in plan.skipped_labels
     })
+    extra_note = ""
+    if plan.topic_seconds > 1:
+        extra_note += f", {plan.topic_seconds / 60:.1f} min of {', '.join(plan.cut_topics)}"
+    if plan.interstitial_seconds > 1:
+        extra_note += f", {plan.interstitial_seconds / 60:.1f} min of ads"
     _log(f"[recut] {ep['title'][:60]}: {plan.cut_seconds / 60:.1f} min "
-         f"({plan.fraction * 100:.0f}%) of {', '.join(names) or 'nobody'}")
+         f"({plan.fraction * 100:.0f}%) of {', '.join(names) or 'nobody'}{extra_note}")
     cutter.render(source, plan, cfg, cut_path)
 
     db.upsert_episode(conn, ep["feed_id"], key, ep["guid"], {
@@ -469,6 +562,10 @@ def recut_episode(conn, cfg: Config, ep) -> Outcome:
         "result_seconds": audio.duration_seconds(cut_path),
         "cut_seconds": plan.cut_seconds,
         "cut_speakers": ", ".join(names),
+        "interstitial_seconds": plan.interstitial_seconds,
+        "topic_seconds": plan.topic_seconds,
+        "cut_topics": ", ".join(plan.cut_topics),
+        "skip_note": note,
         "status": "ready",
         "error": None,
     })

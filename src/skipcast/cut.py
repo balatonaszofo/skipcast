@@ -80,6 +80,10 @@ class Plan:
     # from a speaker. Reported separately because they are different promises:
     # one is "you asked for this voice gone", the other "this was not the show".
     interstitial_seconds: float = 0.0
+    # And how much came from chapters about a subject being skipped — a third
+    # promise again: "this was the show, and you said not this part of it".
+    topic_seconds: float = 0.0
+    cut_topics: list[str] = field(default_factory=list)
 
     @property
     def fraction(self) -> float:
@@ -246,14 +250,19 @@ def _keep_only_candidates(doc: dict, cfg: Config, labels: list[str],
     return candidates
 
 
+# Marks an extra range as a chapter removed for its subject rather than an ad
+# read. Carried in the region's label so the cut log says which it was.
+TOPIC_KIND = "topic"
+
+
 def _extra_regions(extra_cuts, duration: float, plan: Plan) -> list[Region]:
     """Ranges to remove that have nothing to do with who is speaking.
 
-    Ad reads and housekeeping, found in the transcript rather than in the
-    diarization. They arrive already filtered for length and confidence, so
-    they go straight in as candidates — but they are recorded as decisions like
-    everything else, because "why is this gone" has to be answerable from the
-    cut log alone.
+    Ad reads and housekeeping found in the transcript, and chapters about a
+    subject being skipped. Neither comes from the diarization, and both arrive
+    already filtered for length and confidence, so they go straight in as
+    candidates — but they are recorded as decisions like everything else,
+    because "why is this gone" has to be answerable from the cut log alone.
     """
     out = []
     for item in extra_cuts or []:
@@ -265,7 +274,7 @@ def _extra_regions(extra_cuts, duration: float, plan: Plan) -> list[Region]:
         out.append(Region(start, end, kind))
         plan.decisions.append(Decision(
             speaker_label=kind,
-            matched_name=None,
+            matched_name=item.get("term") if kind == TOPIC_KIND else None,
             similarity=0.0,
             start=round(start, 3),
             end=round(end, 3),
@@ -274,6 +283,9 @@ def _extra_regions(extra_cuts, duration: float, plan: Plan) -> list[Region]:
             reason=(item.get("what") or kind)
                    + f" ({item.get('confidence', 'unsure')})",
         ))
+        if kind == TOPIC_KIND and item.get("term"):
+            if item["term"] not in plan.cut_topics:
+                plan.cut_topics.append(item["term"])
     return out
 
 
@@ -331,12 +343,19 @@ def _finish_plan(plan: Plan, candidates: list[Region], extras: list[Region],
     """Pad, union and check the candidates, whatever produced them."""
     c = cfg.cut
 
-    # What the interstitials removed that the speaker rules would not have
+    # What each kind of extra removed that the rules before it would not have
     # anyway. An ad inside a stretch of a speaker already being cut shortens
     # the episode by nothing extra, and counting it twice would make the feed
-    # note claim more was removed than went.
+    # note claim more was removed than went. The order — speakers, then
+    # skipped chapters, then ads — is the order the promises were made in, and
+    # overlap is credited to the earlier one.
+    topic_extras = [r for r in extras if r.speaker_label == TOPIC_KIND]
+    ad_extras = [r for r in extras if r.speaker_label != TOPIC_KIND]
+    plan.topic_seconds = sum(
+        r.duration for r in subtract(topic_extras, candidates)
+    )
     plan.interstitial_seconds = sum(
-        r.duration for r in subtract(extras, candidates)
+        r.duration for r in subtract(ad_extras, candidates + topic_extras)
     )
     candidates = candidates + extras
 
@@ -587,6 +606,8 @@ def write_log(plan: Plan, doc: dict, cfg: Config, dest: Path) -> Path:
             "absorbed_padding_slivers": plan.absorbed_slivers,
             "dropped_short_keeps": plan.dropped_keeps,
             "interstitial_seconds": round(plan.interstitial_seconds, 3),
+            "topic_seconds": round(plan.topic_seconds, 3),
+            "cut_topics": plan.cut_topics,
         },
         "cuts": [asdict(r) for r in plan.cuts],
         # Recorded rather than left to be derived: timeline.py maps original

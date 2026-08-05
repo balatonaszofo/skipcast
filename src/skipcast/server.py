@@ -507,6 +507,20 @@ def create_app(cfg: Config) -> FastAPI:
                 tl = timeline.for_episode(row)
                 data["topics"] = _stamp(data.get("topics") or [], tl)
                 data["specifics"] = _stamp(data.get("specifics") or [], tl)
+                # Which chapters are gone because of a skipped subject, so the
+                # page can show them struck through with the term responsible
+                # rather than silently omitting them.
+                from . import entities
+
+                by_pos = {
+                    ch["position"]: ch
+                    for ch in entities.skipped_chapters(c, row["id"], row["feed_id"])
+                }
+                for i, t in enumerate(data["topics"]):
+                    ch = by_pos.get(i)
+                    t["skipped_by"] = ch["terms"] if ch else []
+                    if ch:
+                        t["at_seconds"] = ch["start_seconds"]
                 out["index"] = data
             except ValueError:
                 pass
@@ -784,6 +798,183 @@ def create_app(cfg: Config) -> FastAPI:
         n = entities.watch_mark_seen(c)
         c.close()
         return {"ok": True, "terms": n}
+
+    @app.get("/api/topics")
+    def api_topics():
+        """Every term with an opinion attached, and what it has actually done."""
+        _need_ui()
+        from . import entities
+
+        c = conn()
+        cut_counts: dict[str, dict] = {}
+        for r in c.execute(
+            "SELECT cut_topics, topic_seconds FROM episodes "
+            "WHERE cut_topics IS NOT NULL AND cut_topics != ''"
+        ):
+            names = [n.strip() for n in (r["cut_topics"] or "").split(",") if n.strip()]
+            for n in names:
+                acc = cut_counts.setdefault(n.casefold(),
+                                            {"episodes": 0, "seconds": 0.0})
+                acc["episodes"] += 1
+                # topic_seconds is the episode's total across its terms; split
+                # it evenly rather than overstating each one.
+                acc["seconds"] += float(r["topic_seconds"] or 0) / len(names)
+        hits = {h["term"]: h for h in entities.watch_hits(c, 3)}
+        out = []
+        for row in entities.terms(c):
+            state = entities.state_of(row)
+            done = cut_counts.get(row["term_norm"], {})
+            h = hits.get(row["term"])
+            out.append({
+                "term": row["term"], "state": state,
+                "episodes": done.get("episodes", 0),
+                "seconds": round(done.get("seconds", 0.0)),
+                "new": h["new"] if h else 0,
+                "mentions": h["total"] if h else 0,
+            })
+        rules = entities.feed_rules(c)
+        c.close()
+        return {"topics": out, "rules": rules}
+
+    @app.post("/api/topics")
+    async def api_topic_state(request: Request):
+        """Set a term's state, and re-cut only if that changed what is skipped.
+
+        Watching a term, or adding one fresh, touches no audio — only crossing
+        into or out of skip does, so only that is worth an ffmpeg pass over
+        every affected episode. The recuts are queued rather than run here:
+        each one takes minutes, and the caller is a tap on a phone.
+        """
+        _need_ui()
+        from . import entities
+
+        body = await request.json()
+        term = (body.get("term") or "").strip()
+        state = body.get("state")
+        if state not in ("watch", "skip", None):
+            raise HTTPException(400, "state must be watch, skip or null")
+        c = conn()
+        was_skip = any(
+            r["term_norm"] == entities.normalize(term)
+            and entities.state_of(r) == "skip"
+            for r in entities.terms(c)
+        )
+        try:
+            entities.set_state(c, term, state)
+        except ValueError as exc:
+            c.close()
+            raise HTTPException(400, str(exc)) from exc
+        now_skip = state == "skip"
+        queued = (_requeue_for_term(c, term)
+                  if body.get("recut", True) and was_skip != now_skip else 0)
+        c.close()
+        worker.poke()
+        return {"ok": True, "recutting": queued}
+
+    def _requeue_for_term(c, term: str) -> int:
+        """Re-cut every ready episode whose chapters mention a term.
+
+        Both directions need this: starting a skip removes chapters, and
+        stopping one has to put them back.
+        """
+        from . import entities
+
+        keys = {h["episode_key"] for h in entities.skip_impact(c, term)}
+        # Episodes already carrying the term in their cut log need rebuilding
+        # too — that is how a skip gets undone.
+        for r in c.execute("SELECT key, cut_topics FROM episodes "
+                           "WHERE cut_topics IS NOT NULL AND cut_topics != ''"):
+            names = {n.strip().casefold()
+                     for n in (r["cut_topics"] or "").split(",")}
+            if entities.normalize(term) in names:
+                keys.add(r["key"])
+        for key in keys:
+            ep = db.get_episode_by_key(c, key)
+            if ep is not None and ep["status"] == "ready":
+                jobs.enqueue(c, "recut", key, f"Re-cut {ep['title'][:40]}", {})
+        return len(keys)
+
+    @app.get("/api/topics/impact")
+    def api_topic_impact(term: str):
+        """What skipping this term would remove, before anything is cut."""
+        _need_ui()
+        from . import entities
+
+        c = conn()
+        hits = entities.skip_impact(c, term)
+        c.close()
+        return {
+            "term": term, "count": len(hits),
+            "seconds": round(sum(h["seconds"] for h in hits)),
+            "episodes": len({h["episode_key"] for h in hits}),
+            "chapters": hits[:20],
+        }
+
+    @app.post("/api/feeds/{slug}/topic-rules")
+    async def api_topic_rule(slug: str, request: Request):
+        _need_ui()
+        from . import entities
+
+        body = await request.json()
+        c = conn()
+        row = db.get_feed(c, slug)
+        if row is None:
+            c.close()
+            raise HTTPException(404, "no such feed")
+        entities.set_feed_rule(c, (body.get("term") or "").strip(),
+                               row["id"], body.get("skip"))
+        queued = _requeue_for_term(c, (body.get("term") or "").strip())
+        c.close()
+        worker.poke()
+        return {"ok": True, "recutting": queued}
+
+    @app.get("/api/feeds/{slug}/segments")
+    def api_feed_segments(slug: str):
+        """Segments this show runs most weeks, as skip suggestions."""
+        _need_ui()
+        from . import entities
+
+        c = conn()
+        row = db.get_feed(c, slug)
+        if row is None:
+            c.close()
+            raise HTTPException(404, "no such feed")
+        known = {entities.normalize(t["term"]) for t in entities.terms(c)}
+        out = [s for s in entities.recurring_segments(c, row["id"])
+               if entities.normalize(s["term"]) not in known]
+        c.close()
+        return {"segments": out}
+
+    @app.post("/api/episodes/{key}/hide")
+    async def api_hide_episode(key: str, request: Request):
+        """Drop an episode from Listen, or put it back. Files stay on disk."""
+        _need_ui()
+        body = await request.json() if await request.body() else {}
+        hidden = bool(body.get("hidden", True))
+        c = conn()
+        row = db.get_episode_by_key(c, key)
+        if row is None:
+            c.close()
+            raise HTTPException(404, "unknown episode")
+        db.upsert_episode(c, row["feed_id"], key, row["guid"],
+                          {"hidden": 1 if hidden else 0,
+                           "skip_note": None if hidden else row["skip_note"]})
+        c.close()
+        return {"ok": True, "hidden": hidden}
+
+    @app.post("/api/episodes/{key}/keep")
+    def api_keep_episode(key: str):
+        """Listen anyway: clear the mostly-skipped note and leave it whole."""
+        _need_ui()
+        c = conn()
+        row = db.get_episode_by_key(c, key)
+        if row is None:
+            c.close()
+            raise HTTPException(404, "unknown episode")
+        db.upsert_episode(c, row["feed_id"], key, row["guid"],
+                          {"skip_note": None})
+        c.close()
+        return {"ok": True}
 
     @app.get("/api/persons")
     def api_persons():
