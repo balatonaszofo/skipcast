@@ -489,7 +489,7 @@ PAGE = r"""<!doctype html>
 <div id="sheet"><div class="bg" onclick="closeSheet()"></div><div class="box" id="sheetbox"></div></div>
 
 <nav id="tabbar">
-  <button data-tab="home"><span class="ic"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="m3 10 9-7 9 7v10a1 1 0 0 1-1 1h-5v-7h-6v7H4a1 1 0 0 1-1-1Z"/></svg></span>Home</button>
+  <button data-tab="home"><span class="ic"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="m3 10 9-7 9 7v10a1 1 0 0 1-1 1h-5v-7h-6v7H4a1 1 0 0 1-1-1Z"/></svg></span>Today</button>
   <button data-tab="library"><span class="ic"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke-width="2"><rect x="3" y="3" width="8" height="8" rx="1.5"/><rect x="13" y="3" width="8" height="8" rx="1.5"/><rect x="3" y="13" width="8" height="8" rx="1.5"/><rect x="13" y="13" width="8" height="8" rx="1.5"/></svg></span>Library</button>
   <button data-tab="jobs"><span class="ic"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M4 12h3l2.5-7 5 14 2.5-7h3"/></svg><span class="bdg" id="jobbadge"></span></span>Activity</button>
 </nav>
@@ -979,7 +979,7 @@ function syncTopbar() {
        : VIEW.kind === 'episode' ? ((VIEW.data && VIEW.data.title) || '')
        : VIEW.kind === 'job' ? 'Activity'
        : 'Add a show')
-    : ({home: 'Listen', library: 'Library', jobs: 'Activity'})[TAB] || '';
+    : ({home: 'Today', library: 'Library', jobs: 'Activity'})[TAB] || '';
   document.getElementById('topbar-t').textContent = t;
 }
 
@@ -1008,10 +1008,16 @@ function freshOf(list) {
 
 function renderHome() {
   const running = STATE.jobs.filter(j => j.status === 'running' || j.status === 'queued');
+  const briefJob = STATE.jobs.find(j => j.kind === "digest" && (j.status === "queued" || j.status === "running"));
   el.innerHTML = `
-    <div class="bigtitle"><h2>Listen</h2><span class="spacer"></span>
+    <div class="bigtitle"><h2>Today</h2><span class="spacer"></span>
       ${running.length ? `<button class="runpill" onclick="go('jobs')">
         <span class="spin"></span> ${running.length} running</button>` : ''}</div>
+    <div class="sub" style="margin:2px 0 10px">Make one focused brief from recent, unheard moments across your shows.</div>
+    ${briefJob ? `<div class="card pad" style="margin:0 0 16px"><div class="title">Preparing your brief</div>
+      <div class="sub">${esc(briefJob.progress || briefJob.label || "Waiting to start")} &middot; <a onclick="go('jobs')">View activity</a></div></div>` :
+      `<div class="wrap" style="margin:0 0 16px">${[15, 30, 45, 60].map(m =>
+        `<button class="btn" onclick="buildDigest(${m})">I have ${m} min</button>`).join('')}</div>`}
     <div class="searchrow">
       <div class="search">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#9a9fad"
@@ -1054,13 +1060,18 @@ function browseHtml() {
     return `<div class="empty">Nothing here yet.<br><br>
       <button class="btn primary" onclick="openAdd()">Add your first show</button></div>`;
   }
+  if (!LISTEN.length) {
+    return `<div class="empty">Your shows are added, but nothing is ready for a brief yet.<br><br>
+      New episodes need to finish processing before Skipcast can build a brief.<br><br>
+      <button class="btn primary" onclick="go('library')">Check your shows</button></div>`;
+  }
   const cont = LISTEN.filter(e => !e.finished && (e.position || 0) > 30);
   const played = LISTEN.filter(e => e.finished);
   const fresh = freshOf(LISTEN);
-  return (cont.length ? `
+  return digestHtml() +
+    (cont.length ? `
     <div class="sec"><h4>Continue</h4></div>
     <div class="carousel">${cont.map(contCard).join('')}</div>` : '') +
-    digestHtml() +
     shelfHtml() + `
     <div class="sec"><h4>New episodes</h4></div>
     <div class="card">${fresh.length ? fresh.map(epRow).join('')
@@ -1149,21 +1160,28 @@ function digestPieces(d) {
 
 function digestHtml() {
   const latest = DIGESTS && DIGESTS.length ? DIGESTS[0] : null;
+  const builtOn = latest && latest.created_at
+    ? new Date(latest.created_at).toLocaleDateString(undefined, {day: "numeric", month: "short"})
+    : "";
   const head = latest ? `
-    <div class="row" onclick="UI.digestOpen=!UI.digestOpen;render()">
+    <div class="row" role="button" tabindex="0" aria-expanded="${UI.digestOpen}"
+      onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();UI.digestOpen=!UI.digestOpen;render()}"
+      onclick="UI.digestOpen=!UI.digestOpen;render()">
       <div class="ic">◍</div>
-      <div class="grow"><div class="t">Your digest</div>
-      <div class="s">${digestStats(latest)} · unheard only
+      <div class="grow"><div class="t">Latest brief</div>
+      <div class="s">${digestStats(latest)} &middot; built from unheard moments${builtOn ? " &middot; " + builtOn : ""}
         <span style="opacity:.75; margin-left:4px">${UI.digestOpen ? '▾' : '▸'}</span></div>
       ${latest.theme ? `<div class="s" style="white-space:nowrap; overflow:hidden;
         text-overflow:ellipsis">${esc(latest.theme)}</div>` : ''}</div>
-      <button class="go" onclick="event.stopPropagation();playDigest('${esc(latest.key)}')">
+      <button class="go" aria-label="Play latest brief" onclick="event.stopPropagation();playDigest('${esc(latest.key)}')">
         ${NOW && NOW.key === 'dg:' + latest.key && !audio.paused ? '❚❚' : '▶'}</button>
     </div>` : `
-    <div class="row" onclick="UI.digestOpen=!UI.digestOpen;render()">
+    <div class="row" role="button" tabindex="0" aria-expanded="${UI.digestOpen}"
+      onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();UI.digestOpen=!UI.digestOpen;render()}"
+      onclick="UI.digestOpen=!UI.digestOpen;render()">
       <div class="ic">◍</div>
-      <div class="grow"><div class="t">Make a digest</div>
-      <div class="s">One thing to play for the time you have</div></div>
+      <div class="grow"><div class="t">Build your brief</div>
+      <div class="s">One focused thing to play for the time you have</div></div>
       <span style="opacity:.8">${UI.digestOpen ? '▾' : '▸'}</span>
     </div>`;
   const hero = `<div class="digest">${head}</div>`;
@@ -1174,10 +1192,7 @@ function digestHtml() {
   }
   return hero + `
     <div class="card pad" style="margin-bottom:20px">
-      <div class="sub" style="margin-bottom:10px">Pick a length — it assembles the
-        best topics you have not heard, same-story takes back to back:</div>
-      <div class="wrap">${[15, 30, 45, 60].map(m =>
-        `<button class="btn" onclick="buildDigest(${m})">${m} min</button>`).join('')}</div>
+      <div class="sub" style="margin-bottom:10px">Past briefs are kept here. Each one was built from recent unheard topics, with related coverage kept together.</div>
       ${DIGESTS.map(d => `
         <div class="item">
           <div class="row">
@@ -1194,6 +1209,10 @@ function digestHtml() {
 }
 
 async function buildDigest(minutes) {
+  if (STATE.jobs.some(j => j.kind === "digest" && (j.status === "queued" || j.status === "running"))) {
+    toast("A brief is already being prepared");
+    return;
+  }
   try {
     await api('/api/digests', {method:'POST', body:{minutes}});
     toast('Assembling your digest — it will appear here in a few minutes');

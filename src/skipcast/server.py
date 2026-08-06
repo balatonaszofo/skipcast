@@ -12,6 +12,7 @@ episodes, and download in chunks.
 from __future__ import annotations
 
 import json
+import math
 import re
 from pathlib import Path
 
@@ -715,11 +716,32 @@ def create_app(cfg: Config) -> FastAPI:
     @app.post("/api/digests")
     async def api_build_digest(request: Request):
         _need_ui()
-        body = await request.json() if await request.body() else {}
+        try:
+            body = await request.json() if await request.body() else {}
+        except ValueError as exc:
+            raise HTTPException(422, "request body must be valid JSON") from exc
+        if not isinstance(body, dict):
+            raise HTTPException(422, "request body must be a JSON object")
+        try:
+            raw_minutes = body.get("minutes")
+            if isinstance(raw_minutes, bool):
+                raise ValueError
+            minutes = float(30 if raw_minutes is None else raw_minutes)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(422, "minutes must be a number") from exc
+        if not math.isfinite(minutes) or not 1 <= minutes <= 120:
+            raise HTTPException(422, "minutes must be between 1 and 120")
         c = conn()
+        active = c.execute(
+            "SELECT id FROM jobs WHERE kind='digest' AND status IN ('queued','running') "
+            "ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        if active is not None:
+            c.close()
+            raise HTTPException(409, "a brief is already being prepared")
         jid = jobs.enqueue(c, "digest", None,
-                           f"Digest {float(body.get('minutes') or 30):g} min",
-                           {"minutes": float(body.get("minutes") or 30),
+                           f"Digest {minutes:g} min",
+                           {"minutes": minutes,
                             "feed": body.get("feed") or None,
                             "include_played": bool(body.get("include_played"))})
         c.close()
