@@ -28,7 +28,12 @@ def require_ffmpeg() -> None:
 
 
 def _run(cmd: list[str]) -> subprocess.CompletedProcess:
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    # ffmpeg/ffprobe write UTF-8 regardless of platform. Without an explicit
+    # encoding, Windows decodes with the system code page (cp1252 here), which
+    # raises inside subprocess's reader thread on the first non-Latin-1 byte —
+    # common in podcast metadata — and leaves stdout/stderr as None.
+    proc = subprocess.run(cmd, capture_output=True, text=True,
+                          encoding="utf-8", errors="replace")
     if proc.returncode != 0:
         tail = "\n".join(proc.stderr.strip().splitlines()[-15:])
         raise FFmpegFailed(f"{cmd[0]} failed ({proc.returncode}):\n{tail}")

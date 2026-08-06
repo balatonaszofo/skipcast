@@ -482,22 +482,19 @@ def render(src: Path, plan: Plan, cfg: Config, dest: Path) -> Path:
         wav = _decode(src, Path(tmp) / "decoded.wav")
 
         graph = _filter_graph(plan, cfg.cut.crossfade_seconds)
-        graph_file = Path(tmp) / "graph.txt"
-        # The graph runs to tens of kilobytes on a heavily cut episode, past
-        # what a command line will take. ffmpeg reads it from a file instead.
-        graph_file.write_text(graph)
 
         cmd = [
             "ffmpeg", "-nostdin", "-y",
             "-i", str(wav),
-            "-filter_complex_script", str(graph_file),
+            "-filter_complex", graph,
             "-map", "[out]",
             "-ac", str(cfg.encode.channels),
             "-c:a", "libmp3lame",
             "-b:a", cfg.encode.bitrate,
             str(dest),
         ]
-        proc = subprocess.run(cmd, capture_output=True, text=True)
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              encoding="utf-8", errors="replace")
         if proc.returncode != 0:
             tail = "\n".join(proc.stderr.strip().splitlines()[-20:])
             raise audio.FFmpegFailed(f"cut failed:\n{tail}")
@@ -538,22 +535,20 @@ def stitch(pieces: list[tuple[Path, float, float]], cfg: Config,
             )
             prev = label
 
-    with tempfile.TemporaryDirectory(prefix="skipcast-digest-") as tmp:
-        graph_file = Path(tmp) / "graph.txt"
-        graph_file.write_text(";".join(parts))
-        cmd = [
-            "ffmpeg", "-nostdin", "-y", *inputs,
-            "-filter_complex_script", str(graph_file),
-            "-map", "[out]",
-            "-ac", str(cfg.encode.channels),
-            "-c:a", "libmp3lame",
-            "-b:a", cfg.encode.bitrate,
-            str(dest),
-        ]
-        proc = subprocess.run(cmd, capture_output=True, text=True)
-        if proc.returncode != 0:
-            tail = "\n".join(proc.stderr.strip().splitlines()[-20:])
-            raise audio.FFmpegFailed(f"digest failed:\n{tail}")
+    cmd = [
+        "ffmpeg", "-nostdin", "-y", *inputs,
+        "-filter_complex", ";".join(parts),
+        "-map", "[out]",
+        "-ac", str(cfg.encode.channels),
+        "-c:a", "libmp3lame",
+        "-b:a", cfg.encode.bitrate,
+        str(dest),
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True,
+                          encoding="utf-8", errors="replace")
+    if proc.returncode != 0:
+        tail = "\n".join(proc.stderr.strip().splitlines()[-20:])
+        raise audio.FFmpegFailed(f"digest failed:\n{tail}")
     return dest
 
 
@@ -563,6 +558,7 @@ def _decode(src: Path, dest: Path) -> Path:
         ["ffmpeg", "-nostdin", "-y", "-i", str(src), "-vn",
          "-c:a", "pcm_s16le", str(dest)],
         capture_output=True, text=True, check=True,
+        encoding="utf-8", errors="replace",
     )
     return dest
 

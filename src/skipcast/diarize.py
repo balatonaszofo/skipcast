@@ -11,6 +11,7 @@ import datetime as dt
 import os
 import sys
 import tempfile
+import warnings
 from dataclasses import dataclass, asdict
 from pathlib import Path
 
@@ -21,6 +22,14 @@ from .config import Config, hf_token
 # before torch is imported, which is why it lives at module scope rather than
 # inside the function that needs it.
 os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+
+# pyannote/speechbrain still call torchaudio's pre-TorchCodec backend APIs,
+# which torchaudio warns on every single call since it started removing them
+# in 2.9. Sliding-window inference re-triggers this per window, so one
+# diarization run prints it dozens of times and buries real errors under it.
+# Cosmetic until pyannote itself migrates — safe to silence.
+warnings.filterwarnings("ignore", message=r".*consolidated into TorchCodec.*",
+                        category=UserWarning)
 
 
 class DiarizationError(RuntimeError):
