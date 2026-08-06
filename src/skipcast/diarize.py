@@ -28,8 +28,7 @@ os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 # in 2.9. Sliding-window inference re-triggers this per window, so one
 # diarization run prints it dozens of times and buries real errors under it.
 # Cosmetic until pyannote itself migrates — safe to silence.
-warnings.filterwarnings("ignore", message=r".*consolidated into TorchCodec.*",
-                        category=UserWarning)
+warnings.filterwarnings("ignore", message=r".*TorchCodec.*", category=UserWarning)
 
 
 class DiarizationError(RuntimeError):
