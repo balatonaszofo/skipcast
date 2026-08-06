@@ -85,6 +85,10 @@ def transcribe_file(path: Path, doc: dict, cfg: Config) -> dict:
             beam_size=t.beam_size,
             word_timestamps=True,
             vad_filter=True,
+            # distil-whisper's own docs recommend disabling this — the
+            # distillation training didn't condition on prior-segment text,
+            # and leaving it on tends to produce repetition loops.
+            condition_on_previous_text=not t.model.startswith("distil-"),
         )
 
         at = _speaker_index(doc)

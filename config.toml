@@ -134,7 +134,13 @@ interval_hours = 6
 # this is CPU-bound on Apple Silicon — budget roughly 6-8 min per 90-min episode
 # at "small", two to three times that at "medium".
 enabled = true
-model = "small"          # tiny | base | small | medium | large-v3
+# distil-small.en is a distilled, English-only model — noticeably faster than
+# "small" on CPU with claimed near-parity accuracy (the distillation was
+# benchmarked against large-v2/v3, not against "small" directly, so treat
+# that as directional rather than guaranteed). distil-medium.en trades some
+# of the speed gain for a larger, likely more accurate model if this turns
+# out too lossy. Also valid: tiny | base | small | medium | large-v3.
+model = "distil-small.en"
 compute_type = "int8"    # int8 is much faster on CPU; float32 is marginally better
 language = "en"          # empty string autodetects, at some cost in speed
 beam_size = 5
