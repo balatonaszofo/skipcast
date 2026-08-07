@@ -134,6 +134,26 @@ class InterstitialConfig:
 
 
 @dataclass
+class HighlightConfig:
+    """Saving the moment you just heard.
+
+    Capture is retroactive because you only know a passage was worth keeping
+    after it has been said, so the button reaches backwards. The default
+    reaches back further than the moment usually needs: trimming a clip down
+    is easy and lossless, recovering a beginning that was never captured
+    means finding the spot in the episode again.
+    """
+    enabled: bool = True
+    lookback_seconds: float = 40.0
+    # Ceiling on a single clip, before and after trimming. Long enough for an
+    # exchange, short enough that a highlight stays an excerpt.
+    max_seconds: float = 300.0
+    # Two taps this close together are one moment noticed twice; the second
+    # extends the first rather than making a near-duplicate.
+    merge_window_seconds: float = 20.0
+
+
+@dataclass
 class EncodeConfig:
     bitrate: str = "128k"
     channels: int = 1
@@ -152,6 +172,7 @@ class Config:
     transcribe: TranscribeConfig = field(default_factory=TranscribeConfig)
     summary: SummaryConfig = field(default_factory=SummaryConfig)
     interstitial: InterstitialConfig = field(default_factory=InterstitialConfig)
+    highlight: HighlightConfig = field(default_factory=HighlightConfig)
     source_path: Path | None = None
 
 
@@ -204,6 +225,7 @@ def load_config(explicit: Path | None = None) -> Config:
         transcribe=_fill(TranscribeConfig, raw.get("transcribe", {})),
         summary=_fill(SummaryConfig, raw.get("summary", {})),
         interstitial=_fill(InterstitialConfig, raw.get("interstitial", {})),
+        highlight=_fill(HighlightConfig, raw.get("highlight", {})),
         source_path=path,
     )
 

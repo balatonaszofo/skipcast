@@ -190,6 +190,24 @@ def index_transcript(conn, key: str, transcript: dict) -> None:
         _log(f"[poll]   could not index transcript: {exc}")
 
 
+def backfill_highlights(conn, ep) -> None:
+    """Attach words to highlights saved before this episode had a transcript.
+
+    An episode is playable — and so can be highlighted — from the moment its
+    cut lands, but transcription runs on a separate worker and can be an hour
+    behind on a long one. Anything saved in that window is a range with no
+    quote until this runs.
+    """
+    from . import highlights
+
+    try:
+        n = highlights.backfill(conn, ep["id"])
+        if n:
+            _log(f"[poll]   filled in {n} highlight quote(s)")
+    except Exception as exc:  # noqa: BLE001 — never fail an episode over this
+        _log(f"[poll]   could not fill in highlight quotes: {exc}")
+
+
 CONFIDENCE_ORDER = {"unsure": 0, "likely": 1, "certain": 2}
 
 
@@ -422,6 +440,7 @@ def transcribe_and_summarize(conn, cfg: Config, ep, force: bool = False,
         return
 
     index_transcript(conn, key, transcript)
+    backfill_highlights(conn, ep)
 
     if not cfg.summary.enabled:
         return

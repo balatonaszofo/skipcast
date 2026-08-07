@@ -403,6 +403,37 @@ PAGE = r"""<!doctype html>
               font-size:12.5px; color:rgba(255,255,255,.85); cursor:pointer; }
   #np .next.on { display:flex; }
   #np .next .lbl { color:rgba(255,255,255,.45); flex:none; }
+  /* Mirrors .rate on the other side of the transport. */
+  #np .clip { position:absolute; left:30px; color:rgba(255,255,255,.75);
+              font-size:19px; padding:8px; line-height:1; }
+  #np .clip:disabled { opacity:.25; }
+  #np .clip.saved { color:var(--accent); }
+
+  /* ---- clips ---- */
+  .clipcard { padding:14px 15px; border-bottom:1px solid var(--line); }
+  .clipcard:last-child { border-bottom:0; }
+  /* Forty seconds of speech is a lot of words. Clamped by default so the tab
+     reads as a list of moments rather than a wall of transcript. */
+  .clipcard .q { font-size:14.5px; line-height:1.5; white-space:pre-wrap;
+                 display:-webkit-box; -webkit-line-clamp:5; line-clamp:5;
+                 -webkit-box-orient:vertical; overflow:hidden; }
+  .clipcard .q.open { display:block; overflow:visible; }
+  .clipcard .q.none { color:var(--muted); font-style:italic; }
+  .clipcard .more { color:var(--accent); font-size:12.5px; margin-top:6px; }
+  .clipcard .cite { color:var(--muted); font-size:12px; margin-top:8px;
+                    display:flex; gap:6px; flex-wrap:wrap; align-items:baseline; }
+  .clipcard .cite b { color:var(--fg); font-weight:650; }
+  .clipcard .acts { display:flex; gap:8px; margin-top:11px; flex-wrap:wrap; }
+  .clipcard .acts .btn { padding:7px 12px; font-size:12.5px; }
+  .clipcard .note { margin-top:9px; font-size:12.5px; color:var(--warn); }
+  .trimbox { margin-top:12px; border-top:1px solid var(--line); padding-top:11px; }
+  .trimbox .hint { color:var(--muted); font-size:12px; margin-bottom:9px; }
+  .sent { display:block; width:100%; text-align:left; padding:8px 10px;
+          border-radius:9px; font-size:13.5px; line-height:1.45;
+          color:var(--muted); border:1px solid transparent; }
+  .sent.on { background:var(--card2); color:var(--fg); border-color:var(--accent); }
+  .sent .who { color:var(--accent); font-size:11px; font-weight:650;
+               display:block; margin-bottom:2px; }
 
   /* ---- action sheet ---- */
   #sheet { position:fixed; inset:0; z-index:150; display:none; }
@@ -476,6 +507,8 @@ PAGE = r"""<!doctype html>
     <div class="times"><span id="np-cur">0:00</span><span id="np-left">−0:00</span></div>
   </div>
   <div class="ctrl">
+    <button class="clip" id="np-clip" onclick="saveClip()"
+            aria-label="save the moment just played" title="Save this moment">✂</button>
     <button class="sk" onclick="seekBy(-15)" aria-label="back 15 seconds"><b>↺</b>15</button>
     <button class="pp" id="np-play" onclick="togglePlay()">▶</button>
     <button class="sk" onclick="seekBy(30)" aria-label="forward 30 seconds"><b>↻</b>30</button>
@@ -491,6 +524,7 @@ PAGE = r"""<!doctype html>
 <nav id="tabbar">
   <button data-tab="home"><span class="ic"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="m3 10 9-7 9 7v10a1 1 0 0 1-1 1h-5v-7h-6v7H4a1 1 0 0 1-1-1Z"/></svg></span>Today</button>
   <button data-tab="library"><span class="ic"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke-width="2"><rect x="3" y="3" width="8" height="8" rx="1.5"/><rect x="13" y="3" width="8" height="8" rx="1.5"/><rect x="3" y="13" width="8" height="8" rx="1.5"/><rect x="13" y="13" width="8" height="8" rx="1.5"/></svg></span>Library</button>
+  <button data-tab="clips"><span class="ic"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M6 3h12a1 1 0 0 1 1 1v17l-7-4-7 4V4a1 1 0 0 1 1-1Z"/></svg></span>Clips</button>
   <button data-tab="jobs"><span class="ic"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M4 12h3l2.5-7 5 14 2.5-7h3"/></svg><span class="bdg" id="jobbadge"></span></span>Activity</button>
 </nav>
 
@@ -730,6 +764,10 @@ function syncMini() {
   const on = !!NOW;
   document.getElementById('mini').classList.toggle('on', on);
   document.body.classList.toggle('playing', on);
+  // A brief is stitched from many episodes, so there is no single episode
+  // clock to convert a position against — nothing to save a clip from.
+  const clipBtn = document.getElementById('np-clip');
+  if (clipBtn) clipBtn.disabled = !on || !!NOW.digest;
   if (!on) { closeNP(); return; }
   document.getElementById('m-title').textContent = NOW.title || '';
   const img = document.getElementById('m-art');
@@ -994,6 +1032,7 @@ function render() {
   if (VIEW && VIEW.kind === 'add') return renderAdd();
   if (TAB === 'home') return renderHome();
   if (TAB === 'library') return renderLibrary();
+  if (TAB === 'clips') return renderClips();
   if (TAB === 'jobs') return renderJobs();
 }
 
@@ -2538,12 +2577,197 @@ async function reloadEpisode(key) {
   } catch (e) {}
 }
 
+/* ---- clips ------------------------------------------------------------- */
+/* A clip is saved by reaching backwards from where playback is: you only know
+   a passage was worth keeping once it has been said. The server converts the
+   player's position into the original episode's clock and works out which
+   stretches of it the listener actually heard, so nothing that was cut out of
+   the edit can reappear inside a clip. */
+let CLIPS = null;
+const CLIPUI = {open: null, segs: {}, sel: {}, expanded: {}};
+
+/* Roughly the length that overflows the clamp; only past this is there
+   anything hidden worth offering to unfold. */
+const QUOTE_CLAMP = 260;
+function toggleQuote(key) {
+  CLIPUI.expanded[key] = !CLIPUI.expanded[key];
+  render();
+}
+
+async function saveClip() {
+  if (!NOW) return;
+  if (NOW.digest) return toast('Clips are saved from episodes, not briefs');
+  const btn = document.getElementById('np-clip');
+  if (btn) { btn.disabled = true; }
+  try {
+    const h = await api('/api/highlights', {method: 'POST',
+      body: {episode_key: NOW.key, position: audio.currentTime || 0}});
+    CLIPS = null;
+    if (btn) { btn.classList.add('saved'); setTimeout(() => btn.classList.remove('saved'), 1200); }
+    // A clip saved before the transcript lands is a range with no words yet;
+    // say so rather than showing an empty quote and looking broken.
+    toast(h.quote ? `Saved ${Math.round(h.seconds)}s` : 'Saved — words follow once transcribed');
+    if (TAB === 'clips' && !VIEW) render();
+  } catch (e) { toast(e.message); }
+  finally { if (btn) btn.disabled = false; }
+}
+
+async function loadClips() {
+  try { CLIPS = (await api('/api/highlights')).highlights; }
+  catch (e) { CLIPS = []; toast(e.message); }
+  if (TAB === 'clips' && !VIEW) render();
+}
+
+function playClip(btn, key) {
+  // Shares the one <audio> with samples, so it clears whatever was playing.
+  // The first play renders the file server-side, which is why it can take a
+  // moment on a clip that has never been played.
+  if (playingBtn) playingBtn.classList.remove('on');
+  if (playingBtn === btn && !audio.paused) { audio.pause(); playingBtn = null; return; }
+  savePosition(true);
+  NOW = null; NPCH = null; stopAt = null; syncMini();
+  audio.src = `/highlights/${key}.mp3`;
+  audio.playbackRate = RATE;
+  audio.play().catch(() => toast('Playback blocked — tap again'));
+  playingBtn = btn; btn.classList.add('on');
+}
+
+function clipCitation(c) {
+  const bits = [c.speaker_name, c.feed_title,
+                c.published_ts ? dateShort(c.published_ts) : ''].filter(Boolean);
+  return `${c.quote || '(no transcript yet)'}\n\n— ${bits.join(', ')}\n${c.episode_title || ''}`.trim();
+}
+
+function shareClip(key) {
+  const c = (CLIPS || []).find(x => x.key === key);
+  if (!c) return;
+  const url = `${location.origin}/highlights/${key}.mp3`;
+  const text = clipCitation(c);
+  const items = [
+    {label: 'Copy quote', fn: () => copy(text)},
+    {label: 'Copy audio link', fn: () => copy(url)},
+    {label: 'Download audio', fn: () => { window.location.href = url; }},
+    {label: 'Delete clip', danger: true, fn: () => removeClip(key)},
+  ];
+  if (navigator.share) items.unshift({label: 'Share…', fn: () =>
+    navigator.share({title: c.episode_title || 'Clip', text, url}).catch(() => {})});
+  openSheet(items);
+}
+
+async function removeClip(key) {
+  try {
+    await api('/api/highlights/' + key, {method: 'DELETE'});
+    CLIPS = null; CLIPUI.open = null; toast('Deleted'); render();
+  } catch (e) { toast(e.message); }
+}
+
+async function toggleTrim(key) {
+  if (CLIPUI.open === key) { CLIPUI.open = null; render(); return; }
+  CLIPUI.open = key;
+  CLIPUI.sel[key] = null;
+  render();
+  if (!CLIPUI.segs[key]) {
+    try { CLIPUI.segs[key] = (await api(`/api/highlights/${key}/segments`)).segments; }
+    catch (e) { CLIPUI.segs[key] = []; toast(e.message); }
+    if (CLIPUI.open === key) render();
+  }
+}
+
+/* Selection is by sentence: they are bounded by the pauses the speaker
+   actually took, so a clip cut on them opens and closes cleanly. First tap
+   picks one, the next extends the run, tapping the only selected one clears. */
+function pickSentence(key, i) {
+  const cur = CLIPUI.sel[key];
+  if (!cur) CLIPUI.sel[key] = {a: i, b: i};
+  else if (cur.a === i && cur.b === i) CLIPUI.sel[key] = null;
+  else if (i < cur.a) CLIPUI.sel[key] = {a: i, b: cur.b};
+  else CLIPUI.sel[key] = {a: cur.a, b: i};
+  render();
+}
+
+async function applyTrim(key) {
+  const sel = CLIPUI.sel[key], segs = CLIPUI.segs[key] || [];
+  if (!sel || !segs.length) return;
+  try {
+    await api(`/api/highlights/${key}/trim`, {method: 'POST',
+      body: {start: segs[sel.a].start, end: segs[sel.b].end}});
+    delete CLIPUI.segs[key];
+    CLIPUI.sel[key] = null; CLIPUI.open = null; CLIPS = null;
+    toast('Trimmed'); render();
+  } catch (e) { toast(e.message); }
+}
+
+function trimBoxHtml(c) {
+  const segs = CLIPUI.segs[c.key];
+  if (!segs) return `<div class="trimbox"><div class="empty"><span class="spin"></span></div></div>`;
+  if (!segs.length) return `<div class="trimbox"><div class="hint">
+    No transcript for this stretch yet, so there is nothing to trim by.</div></div>`;
+  const sel = CLIPUI.sel[c.key];
+  const whole = !sel || (sel.a === 0 && sel.b === segs.length - 1);
+  const picked = sel ? segs.slice(sel.a, sel.b + 1) : [];
+  const secs = picked.reduce((n, s) => n + (s.end - s.start), 0);
+  return `<div class="trimbox">
+    <div class="hint">Tap a sentence to keep it; tap another to extend.</div>
+    ${segs.map((s, i) => `<button class="sent ${sel && i >= sel.a && i <= sel.b ? 'on' : ''}"
+        onclick="pickSentence('${c.key}', ${i})">
+        ${i === 0 || segs[i-1].speaker !== s.speaker
+          ? `<span class="who">${esc(s.speaker)}</span>` : ''}${esc(s.text)}</button>`).join('')}
+    <div class="acts">
+      <button class="btn primary" onclick="applyTrim('${c.key}')"
+        ${whole ? 'disabled' : ''}>Trim to ${secs ? Math.round(secs) + 's' : 'selection'}</button>
+      <button class="btn" onclick="toggleTrim('${c.key}')">Done</button>
+    </div>
+    <div class="hint" style="margin-top:9px">Trimming only ever narrows a clip —
+      the audio outside what you saved is not part of it.</div>
+  </div>`;
+}
+
+function renderClips() {
+  if (CLIPS === null) {
+    loadClips();
+    el.innerHTML = '<div class="empty"><span class="spin"></span></div>';
+    return;
+  }
+  el.innerHTML = `
+    <div class="bigtitle"><h2>Clips</h2></div>
+    ${CLIPS.length ? `<div class="card">${CLIPS.map(c => `
+      <div class="clipcard">
+        <div class="q ${c.quote ? '' : 'none'} ${CLIPUI.expanded[c.key] ? 'open' : ''}"
+             onclick="toggleQuote('${c.key}')">${c.quote
+          ? esc(c.quote) : 'Saved — the words appear once this episode is transcribed.'}</div>
+        ${(c.quote || '').length > QUOTE_CLAMP ? `<div class="more"
+          onclick="toggleQuote('${c.key}')">${CLIPUI.expanded[c.key]
+            ? 'Show less' : 'Show all'}</div>` : ''}
+        <div class="cite">
+          ${c.speaker_name ? `<b>${esc(c.speaker_name)}</b>` : ''}
+          <span>${esc(c.feed_title || '')}</span>
+          ${c.published_ts ? `<span>· ${dateShort(c.published_ts)}</span>` : ''}
+          <span>· ${Math.round(c.seconds || 0)}s</span>
+          ${(c.pieces || []).length > 1
+            ? `<span>· ${c.pieces.length} pieces</span>` : ''}
+        </div>
+        ${c.note ? `<div class="note">${esc(c.note)}</div>` : ''}
+        <div class="acts">
+          <button class="btn" onclick="playClip(this, '${c.key}')">▶ Play</button>
+          <button class="btn" onclick="toggleTrim('${c.key}')">
+            ${CLIPUI.open === c.key ? 'Close' : 'Trim'}</button>
+          <button class="btn" onclick="shareClip('${c.key}')">Share</button>
+          <button class="btn" onclick="setHash('#/episode/${c.episode_key}')">Episode</button>
+        </div>
+        ${CLIPUI.open === c.key ? trimBoxHtml(c) : ''}
+      </div>`).join('')}</div>`
+    : `<div class="card"><div class="empty">
+        Nothing saved yet.<br><br>While an episode is playing, tap ✂ in the
+        player to keep the last ${Math.round((STATE.highlight_lookback || 40))}
+        seconds you just heard.</div></div>`}`;
+}
+
 /* ---- nav -------------------------------------------------------------- */
 /* The URL hash is the single source of navigation truth: tabs are #/home,
    drill-downs are #/feed/<slug>, #/episode/<key>, #/job/<id>, #/add. The
    browser's back gesture, reloads and shared links behave like a web page.
    Old bookmark hashes from the tab-bar era map onto the new shell. */
-const TABS = ['home', 'library', 'jobs'];
+const TABS = ['home', 'library', 'clips', 'jobs'];
 const ALIAS = {listen: 'home', search: 'home', feeds: 'library',
                podcasts: 'library', speakers: 'library', people: 'library'};
 

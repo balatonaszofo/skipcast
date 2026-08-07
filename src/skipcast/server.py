@@ -196,6 +196,27 @@ def create_app(cfg: Config) -> FastAPI:
             raise HTTPException(410, "audio no longer on disk; reprocess this episode")
         return _ranged(path, request, "audio/mpeg")
 
+    @app.api_route("/highlights/{key}.mp3", methods=["GET", "HEAD"])
+    def highlight_audio(key: str, request: Request):
+        """A saved clip, cut on first request and kept afterwards.
+
+        Rendering here rather than at capture time means the clips that are
+        never played never cost anything, and a clip that has been retrimmed
+        rebuilds itself the next time somebody asks for it.
+        """
+        from . import highlights as hl
+
+        c = conn()
+        try:
+            path = hl.render(c, cfg, key)
+        except hl.HighlightError as exc:
+            message = str(exc)
+            raise HTTPException(404 if "no highlight" in message else 410,
+                                message) from exc
+        finally:
+            c.close()
+        return _ranged(path, request, "audio/mpeg")
+
     @app.api_route("/source/{key}.mp3", methods=["GET", "HEAD"])
     def source_audio(key: str, request: Request):
         """The uncut download — what speaker samples are played from."""
@@ -229,6 +250,8 @@ def create_app(cfg: Config) -> FastAPI:
             "summary_enabled": cfg.summary.enabled,
             "summary_provider": cfg.summary.provider,
             "summary_ready": cfg.summary.enabled and summarizer.available(cfg),
+            "highlights_enabled": cfg.highlight.enabled,
+            "highlight_lookback": cfg.highlight.lookback_seconds,
             "feeds": [_row(r) for r in db.list_feeds(c)],
             "speakers": [
                 {"name": s.name, "skip": s.skip, "profiles": s.profile_count,
@@ -759,6 +782,140 @@ def create_app(cfg: Config) -> FastAPI:
         if not ok:
             raise HTTPException(404, "no such digest")
         return {"ok": True, "note": "audio was left on disk"}
+
+    # ---- highlights -------------------------------------------------------
+    def _need_highlights():
+        _need_ui()
+        if not cfg.highlight.enabled:
+            raise HTTPException(404, "highlights disabled in config")
+
+    async def _json_body(request: Request) -> dict:
+        try:
+            body = await request.json() if await request.body() else {}
+        except ValueError as exc:
+            raise HTTPException(422, "request body must be valid JSON") from exc
+        if not isinstance(body, dict):
+            raise HTTPException(422, "request body must be a JSON object")
+        return body
+
+    def _number(body: dict, name: str, default=None):
+        raw = body.get(name)
+        if raw is None:
+            return default
+        if isinstance(raw, bool):
+            raise HTTPException(422, f"{name} must be a number")
+        try:
+            value = float(raw)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(422, f"{name} must be a number") from exc
+        if not math.isfinite(value):
+            raise HTTPException(422, f"{name} must be a finite number")
+        return value
+
+    @app.get("/api/highlights")
+    def api_highlights(episode: str | None = None, limit: int = 100):
+        _need_highlights()
+        from . import highlights as hl
+
+        c = conn()
+        out = [hl.as_dict(r) for r in hl.recent(c, max(1, min(limit, 500)), episode)]
+        c.close()
+        return {"highlights": out}
+
+    @app.post("/api/highlights")
+    async def api_capture_highlight(request: Request):
+        """Save the stretch of audio just played.
+
+        The position is where the *player* is, which is a position in the
+        edited file; converting it to the original clock is capture's job, not
+        the browser's.
+        """
+        _need_highlights()
+        from . import highlights as hl
+
+        body = await _json_body(request)
+        key = body.get("episode_key") or body.get("key")
+        if not isinstance(key, str) or not key:
+            raise HTTPException(422, "episode_key is required")
+        position = _number(body, "position")
+        if position is None:
+            raise HTTPException(422, "position is required")
+        lookback = _number(body, "lookback")
+        note = body.get("note")
+
+        c = conn()
+        try:
+            saved = hl.capture(c, cfg, key, position, lookback,
+                               note if isinstance(note, str) else None)
+        except hl.HighlightError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        finally:
+            c.close()
+        return saved
+
+    @app.get("/api/highlights/{key}/segments")
+    def api_highlight_segments(key: str):
+        """The clip's sentences, each with its own timing — the trim targets."""
+        _need_highlights()
+        from . import highlights as hl
+
+        c = conn()
+        try:
+            return {"segments": hl.segments(c, key)}
+        except hl.HighlightError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        finally:
+            c.close()
+
+    @app.post("/api/highlights/{key}/trim")
+    async def api_trim_highlight(key: str, request: Request):
+        _need_highlights()
+        from . import highlights as hl
+
+        body = await _json_body(request)
+        start, end = _number(body, "start"), _number(body, "end")
+        if start is None or end is None:
+            raise HTTPException(422, "start and end are required")
+        c = conn()
+        try:
+            return hl.retrim(c, cfg, key, start, end)
+        except hl.HighlightError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        finally:
+            c.close()
+
+    @app.post("/api/highlights/{key}/note")
+    async def api_note_highlight(key: str, request: Request):
+        _need_highlights()
+        from . import highlights as hl
+
+        body = await _json_body(request)
+        note = body.get("note")
+        if note is not None and not isinstance(note, str):
+            raise HTTPException(422, "note must be a string")
+        c = conn()
+        row = hl.get(c, key)
+        if row is None:
+            c.close()
+            raise HTTPException(404, "no such highlight")
+        c.execute("UPDATE highlights SET note = ?, updated_at = ? WHERE id = ?",
+                  ((note or "").strip() or None, hl._now(), row["id"]))
+        c.commit()
+        out = hl.as_dict(hl.get(c, key))
+        c.close()
+        return out
+
+    @app.delete("/api/highlights/{key}")
+    def api_remove_highlight(key: str):
+        _need_highlights()
+        from . import highlights as hl
+
+        c = conn()
+        ok = hl.remove(c, key)
+        c.close()
+        if not ok:
+            raise HTTPException(404, "no such highlight")
+        return {"ok": True}
 
     @app.get("/api/overlaps")
     def api_overlaps(days: int = 21, limit: int = 40):

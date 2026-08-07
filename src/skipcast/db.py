@@ -230,6 +230,30 @@ CREATE TABLE IF NOT EXISTS digests (
     created_at  TEXT NOT NULL
 );
 
+-- Saved moments. A highlight is a range, not a file: the source audio is kept
+-- and never changes, so the clip can always be rebuilt, and most highlights
+-- are never shared and so never need rendering at all.
+--
+-- `pieces` is in ORIGINAL-audio seconds, and is a list because the window a
+-- listener captures can straddle a region that was cut out of the edit. Cut
+-- coordinates were the tempting choice — they are what the player reports —
+-- but a recut moves every one of them, and a highlight that silently drifts
+-- to point at the wrong moment is worse than one that fails loudly.
+CREATE TABLE IF NOT EXISTS highlights (
+    id           INTEGER PRIMARY KEY,
+    key          TEXT NOT NULL UNIQUE,
+    episode_id   INTEGER NOT NULL REFERENCES episodes(id) ON DELETE CASCADE,
+    pieces       TEXT NOT NULL,     -- json: [{start,end}], original clock
+    seconds      REAL,              -- sum of the pieces, for display
+    quote        TEXT,              -- transcript under the pieces; may lag
+    speaker_name TEXT,              -- who is talking, when we know
+    note         TEXT,              -- whatever the listener wanted to say
+    audio_path   TEXT,              -- rendered on first play; null until then
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT
+);
+CREATE INDEX IF NOT EXISTS highlights_episode ON highlights(episode_id);
+
 -- Where you got to in each episode. Server-side rather than in the browser so
 -- your place survives clearing site data and follows you between devices.
 CREATE TABLE IF NOT EXISTS playback (

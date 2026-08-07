@@ -212,6 +212,31 @@ min_confidence = "likely"
 # started marking the show itself.
 max_fraction = 0.4
 
+[highlight]
+# Saving the moment you just heard. The button in the player reaches
+# backwards, because you only know a passage was worth keeping once it has
+# been said.
+#
+# A clip is stored as a range into the original audio, not as a file: the
+# source download never changes, so the audio is rebuilt on the first play
+# and clips that are never played never cost anything. A range that straddles
+# something the cut removed is stored as several pieces, so a clip can never
+# hand back an ad the edit took out.
+enabled = true
+
+# How far back the button reaches. Deliberately longer than the moment
+# usually needs — trimming afterwards is easy and lossless, while a beginning
+# that was never captured means finding the spot in the episode again.
+lookback_seconds = 40
+
+# Ceiling on one clip, before and after trimming. Long enough for an
+# exchange, short enough that a highlight stays an excerpt.
+max_seconds = 300
+
+# Two taps closer together than this are one moment noticed twice: the second
+# extends the first instead of leaving a near-duplicate to tidy up later.
+merge_window_seconds = 20
+
 [encode]
 # Re-encode rather than stream-copy. See cut.py for why.
 bitrate = "128k"

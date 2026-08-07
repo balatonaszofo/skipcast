@@ -95,6 +95,28 @@ class Timeline:
                 return k.start + max(0.0, t - offsets[i])
         return self.keeps[-1].end
 
+    def original_spans(self, start: float, end: float) -> list[Span]:
+        """What a stretch of the edit is made of, in original coordinates.
+
+        to_original() answers for a point; a stretch needs a list, because a
+        window of the edit can straddle a removed region and so be two or more
+        disjoint pieces of the original. Anything reproducing audio the
+        listener actually heard — a saved highlight, say — needs every piece
+        and nothing between them, or it quietly reinstates the ad that was
+        taken out.
+        """
+        if end <= start:
+            return []
+        if not self.keeps:
+            return [Span(start, end)]
+        out: list[Span] = []
+        for k, offset in zip(self.keeps, self._offsets()):
+            a = max(start, offset)
+            b = min(end, offset + k.duration)
+            if b - a > 0.001:
+                out.append(Span(k.start + (a - offset), k.start + (b - offset)))
+        return out
+
 
 def identity_timeline(duration: float = 0.0) -> Timeline:
     """For an episode with no cut log — the two clocks are the same."""
